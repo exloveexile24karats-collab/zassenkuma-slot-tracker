@@ -3074,7 +3074,7 @@ export default function SlotDataTracker() {
       }}
     >
       <datalist id={DATALIST_ID}>
-        {eventNames.map((n) => (
+        {allKnownEventNames.map((n) => (
           <option value={n} key={n} />
         ))}
       </datalist>
