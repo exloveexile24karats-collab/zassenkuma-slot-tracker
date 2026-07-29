@@ -1,0 +1,12 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 要望どおり「URLを知っていればログインなしで誰でも読み書きできる」設定です。
+    // 裏を返すと、このFirebase設定値（src/firebase.js の中身）を知っている人は
+    // 誰でもデータを書き換え・削除できてしまいます。公開リポジトリに置く場合は
+    // この点を理解した上で運用してください。
+    match /kv/{document} {
+      allow read, write: if true;
+    }
+  }
+}
