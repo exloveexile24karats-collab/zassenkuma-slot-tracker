@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.4";
+const APP_VERSION = "6.5";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -3136,7 +3136,7 @@ export default function SlotDataTracker() {
             style={{ display: "flex", alignItems: "center", gap: "6px" }}
           >
             <span>{p.name && p.name.trim() ? p.name : `機種${i + 1}`}</span>
-            {p.id === activePageId && pages.length > 1 && (
+            {p.id === activePageId && pages.length > 1 && unlocked && (
               confirmDeletePage === p.id ? (
                 <span style={{ display: "flex", gap: "4px" }}>
                   <button
@@ -3162,13 +3162,15 @@ export default function SlotDataTracker() {
             )}
           </div>
         ))}
-        <button
-          onClick={handleAddPage}
-          className="page-tab"
-          style={{ display: "flex", alignItems: "center", gap: "4px", color: "#4fd1c5" }}
-        >
-          <Plus size={12} /> ページ追加
-        </button>
+        {unlocked && (
+          <button
+            onClick={handleAddPage}
+            className="page-tab"
+            style={{ display: "flex", alignItems: "center", gap: "4px", color: "#4fd1c5" }}
+          >
+            <Plus size={12} /> ページ追加
+          </button>
+        )}
       </div>
 
       <div style={{ borderTop: "1px solid #2a323f", marginBottom: "16px" }} />
@@ -3745,6 +3747,8 @@ export default function SlotDataTracker() {
               days — needed because retroactive event registration only
               patches records going forward from when it happens, not data
               saved before that fix existed */}
+          {unlocked && (
+            <>
           <div className="card" style={{ padding: "14px 18px", marginBottom: "16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
             <div style={{ fontSize: "11px", color: "#5a6272" }}>
               過去に登録・変更したイベントが、全体データ側に反映されていないことがあります。ボタンを押すと、今のイベント登録内容に合わせて全部の日付を最新化します。
@@ -3763,6 +3767,8 @@ export default function SlotDataTracker() {
             <div style={{ marginTop: "-10px", marginBottom: "14px", fontSize: "11px", color: overallStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
               {overallStatus.msg}
             </div>
+          )}
+          </>
           )}
 
           {/* store-wide daily totals, reconstructed from 機種別サマリー — shows
@@ -4954,7 +4960,8 @@ export default function SlotDataTracker() {
         ))}
       </datalist>
 
-      {/* fixed undo-history button, shown regardless of which tab/page is open */}
+      {/* fixed undo-history button, shown regardless of which tab/page is open — but only when unlocked, since it can restore/overwrite data */}
+      {unlocked && (
       <div style={{ position: "fixed", right: "20px", bottom: "20px", zIndex: 50 }}>
         {undoPanelOpen && (
           <div className="card" style={{
@@ -5006,6 +5013,7 @@ export default function SlotDataTracker() {
           🕐 操作履歴{undoHistory.length > 0 ? `（${undoHistory.length}）` : ""}
         </button>
       </div>
+      )}
     </div>
   );
 }
