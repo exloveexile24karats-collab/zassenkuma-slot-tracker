@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.3";
+const APP_VERSION = "6.4";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2776,13 +2776,13 @@ export default function SlotDataTracker() {
       return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
     }
     return (
-      <div className="scrollbar" style={{ overflowX: "auto", maxHeight: "480px", overflowY: "auto", maxWidth: "100%", width: "100%" }}>
+      <div className="scrollbar" style={{ overflowX: "auto", maxWidth: "100%", width: "100%", WebkitOverflowScrolling: "touch", overscrollBehaviorX: "contain" }}>
         <table style={{ borderCollapse: "collapse", fontSize: "11px" }}>
           <thead>
             <tr>
-              <th style={{ position: "sticky", left: 0, top: 0, zIndex: 2, background: "#12161d", padding: "4px 8px", textAlign: "left", borderBottom: "1px solid #2a323f" }} />
+              <th style={{ position: "sticky", left: 0, zIndex: 2, background: "#12161d", padding: "4px 8px", textAlign: "left", borderBottom: "1px solid #2a323f" }} />
               {dates.map((d) => (
-                <th key={d} className="mono" style={{ position: "sticky", top: 0, background: "#12161d", padding: "4px 3px", color: "#5a6272", borderBottom: "1px solid #2a323f", fontSize: "9px", whiteSpace: "nowrap" }}>
+                <th key={d} className="mono" style={{ background: "#12161d", padding: "4px 3px", color: "#5a6272", borderBottom: "1px solid #2a323f", fontSize: "9px", whiteSpace: "nowrap" }}>
                   {d.slice(5)}
                 </th>
               ))}
