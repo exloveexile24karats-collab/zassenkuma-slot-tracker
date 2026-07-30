@@ -203,7 +203,12 @@ const DIGIT7_COLOR = "#f6a04d";
 // 「全体データ」タブの登録済み日付一覧（民レポ/アナスロの状況表示）で
 // 見られるため、重複表示だった。ページ自身の「登録済みの日付」一覧は
 // 引き続き残している。
-const APP_VERSION = "6.8.15";
+// v6.8.16: アナスロで日付を間違えて別の日のデータをそのまま貼り付けて
+// しまうミスを検知する機能を追加。台番号・差枚・G数・BB・RBから作る
+// フィンガープリントで、保存時に他の登録済み日付と完全一致していないか
+// チェックし、一致していれば警告（無視して保存も選べる）。あわせて、
+// 登録済み全日付を対象にした一括の重複チェックボタンも追加。
+const APP_VERSION = "6.8.16";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -402,6 +407,20 @@ function serializeFullStoreRows(rows) {
       ].join("\t");
     })
     .join("\n");
+}
+
+// v6.8.16: a stable fingerprint of a day's worth of アナスロ rows, used to
+// catch an accidental copy-paste of the wrong day's data. Sorted by 台番号
+// so row order in the paste doesn't matter, and built from the actual
+// numbers (not display strings), so it's not just an exact-text match.
+// With this much data, two genuinely different real days matching by
+// chance is effectively impossible — a match means the same table got
+// pasted twice.
+function fingerprintFullTableRows(rows) {
+  return [...(rows || [])]
+    .sort((a, b) => a.no - b.no)
+    .map((r) => `${r.no}:${r.sada}:${r.gsuNormal}:${r.bb}:${r.rb}`)
+    .join("|");
 }
 
 // v6.8.7: 機種名の表記ゆれをより広く吸収する。単純な前方一致だけでなく、
@@ -1280,6 +1299,8 @@ export default function SlotDataTracker() {
   const [fullTableDate, setFullTableDate] = useState(todayStr());
   const [fullTablePasteText, setFullTablePasteText] = useState("");
   const [fullTableStatus, setFullTableStatus] = useState(null);
+  const [fullTableDuplicateWarning, setFullTableDuplicateWarning] = useState(null); // { conflictingDate } | null
+  const [fullTableDuplicateCheckResults, setFullTableDuplicateCheckResults] = useState(null); // array of [dateA, dateB] pairs | null
 
 
   // ---- undo history: snapshots taken right before a destructive action,
@@ -1716,7 +1737,8 @@ export default function SlotDataTracker() {
   // without a page yet isn't lost — see 機種登録時のバックフィル below),
   // and (2) fans out into every EXISTING page whose 正式名称 matches a
   // row's 機種名, replacing that page's entry for this date.
-  const handleSaveFullTable = useCallback(async () => {
+  const handleSaveFullTable = useCallback(async (options) => {
+    const force = options && options.force;
     if (closedDateSet.has(fullTableDate)) {
       setFullTableStatus({ type: "error", msg: `${fullTableDate} は店休日として登録されているため、データを保存できません。` });
       return;
@@ -1726,6 +1748,21 @@ export default function SlotDataTracker() {
       setFullTableStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
       return;
     }
+    // v6.8.16: catch an accidental copy-paste of a DIFFERENT day's table by
+    // fingerprinting this paste and comparing against every other already-
+    // saved date. With this many machines, two genuinely different real
+    // days matching is effectively impossible — a match means a mistake.
+    if (!force) {
+      const thisFingerprint = fingerprintFullTableRows(rows);
+      const conflictingDate = Object.entries(rawFullTableRef.current).find(
+        ([date, existingRows]) => date !== fullTableDate && fingerprintFullTableRows(existingRows) === thisFingerprint
+      );
+      if (conflictingDate) {
+        setFullTableDuplicateWarning({ conflictingDate: conflictingDate[0] });
+        return;
+      }
+    }
+    setFullTableDuplicateWarning(null);
     // 1. persist raw into this date's OWN key (v6.8.11 — back to per-day
     // keys since a month bucket can exceed the real ~1MB per-value limit;
     // a single day, ~60KB, is safely under it). v6.8.10's fix (only mark
@@ -1797,6 +1834,23 @@ export default function SlotDataTracker() {
     setFullTablePasteText("");
     setFullTableDate(addDays(fullTableDate, -1));
   }, [fullTablePasteText, fullTableDate, rawFullTable, pages, pageHistories, dateEventMap, closedDateSet, persistPageHistory]);
+
+  // v6.8.16: scans every currently-known アナスロ date against every other
+  // one and reports any pairs whose content is identical — a retroactive
+  // version of the same accidental-copy-paste check done on every new save.
+  const handleCheckFullTableDuplicates = useCallback(() => {
+    const entries = Object.entries(rawFullTableRef.current);
+    const fingerprints = entries.map(([date, rows]) => [date, fingerprintFullTableRows(rows)]);
+    const pairs = [];
+    for (let i = 0; i < fingerprints.length; i++) {
+      for (let j = i + 1; j < fingerprints.length; j++) {
+        if (fingerprints[i][1] === fingerprints[j][1]) {
+          pairs.push([fingerprints[i][0], fingerprints[j][0]].sort());
+        }
+      }
+    }
+    setFullTableDuplicateCheckResults(pairs);
+  }, []);
 
   // v6.8: called when a NEW page is registered (or an existing page's
   // 正式名称 is set/changed) — replays every raw day already collected for
@@ -4980,7 +5034,7 @@ export default function SlotDataTracker() {
                   }}
                 />
                 <button
-                  onClick={handleSaveFullTable}
+                  onClick={() => handleSaveFullTable()}
                   style={{
                     width: "100%", background: "#4fd1c5", color: "#0b1f1c", border: "none", borderRadius: "8px",
                     padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
@@ -4988,11 +5042,57 @@ export default function SlotDataTracker() {
                 >
                   この日の一括データを保存
                 </button>
+                {fullTableDuplicateWarning && (
+                  <div style={{
+                    marginTop: "8px", padding: "10px", borderRadius: "6px", fontSize: "12px",
+                    background: "#2a1418", border: "1px solid #7a3038", color: "#e5697a",
+                  }}>
+                    ⚠ この内容は {fullTableDuplicateWarning.conflictingDate} と完全に同じデータです。日付を間違えて同じ表を貼り付けていませんか？
+                    <div style={{ marginTop: "8px", display: "flex", gap: "8px" }}>
+                      <button
+                        onClick={() => handleSaveFullTable({ force: true })}
+                        style={{ fontSize: "11px", background: "none", border: "1px solid #7a3038", borderRadius: "6px", color: "#e5697a", padding: "5px 8px", cursor: "pointer" }}
+                      >
+                        同じで間違いない・無視して保存
+                      </button>
+                      <button
+                        onClick={() => setFullTableDuplicateWarning(null)}
+                        style={{ fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "5px 8px", cursor: "pointer" }}
+                      >
+                        取消（貼り直す）
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {fullTableStatus && (
                   <div style={{ marginTop: "8px", fontSize: "11px", color: fullTableStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
                     {fullTableStatus.msg}
                   </div>
                 )}
+                <div style={{ marginTop: "10px" }}>
+                  <button
+                    onClick={handleCheckFullTableDuplicates}
+                    style={{ fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "6px 10px", cursor: "pointer" }}
+                  >
+                    🔍 登録済み日付を重複チェック
+                  </button>
+                  {fullTableDuplicateCheckResults && (
+                    <div style={{ marginTop: "8px", fontSize: "11px" }}>
+                      {fullTableDuplicateCheckResults.length === 0 ? (
+                        <span style={{ color: "#9ece6a" }}>重複は見つかりませんでした。</span>
+                      ) : (
+                        <div style={{ color: "#e5697a" }}>
+                          {fullTableDuplicateCheckResults.length}件の重複ペアが見つかりました：
+                          <ul style={{ margin: "4px 0 0", paddingLeft: "18px" }}>
+                            {fullTableDuplicateCheckResults.map(([a, b]) => (
+                              <li key={`${a}-${b}`}>{a} ⇔ {b}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
