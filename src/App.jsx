@@ -76,6 +76,18 @@ function monthOf(date) {
 function rawFullTableMonthKey(date) {
   return `${RAW_FULLTABLE_KEY_PREFIX}${monthOf(date)}`;
 }
+// v6.8.6: generates the last `count` months as "YYYY-MM" strings (including
+// the current month), used to probe for month-bucket keys directly via GET
+// since storage.list() isn't available in this app's real storage.js
+function recentMonthStrings(count) {
+  const out = [];
+  const now = new Date();
+  for (let i = 0; i < count; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+  }
+  return out;
+}
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
 const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
@@ -130,7 +142,13 @@ const DIGIT7_COLOR = "#f6a04d";
 // あわせてstorage.list()自体の失敗も「データなし」と誤解せず必ず画面に
 // 表示するように変更。起動時に旧形式（v6.8の単一キー・v6.8.1〜6.8.4の
 // 日付別キー）が残っていれば、月別キーへ自動移行する。
-const APP_VERSION = "6.8.5";
+// v6.8.6: v6.8.5で使っていたstorage.list()が、実際のこのアプリの
+// storage.js には実装されておらず（"list is not a function"）、月バケッ
+// トの一覧取得自体が毎回失敗していた。list()に一切依存しない設計に変更：
+// 直近18ヶ月分の月キー名を直接計算し、1件ずつGETで確認する方式にした
+// （存在しない月は素通りするだけなので安全）。旧キーからの移行も
+// list()なしで動作するように書き直し済み。
+const APP_VERSION = "6.8.6";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1301,28 +1319,16 @@ export default function SlotDataTracker() {
         setOverallSummariesLoaded(true);
       }
       try {
-        const listRes = await storage.list(RAW_FULLTABLE_KEY_PREFIX, false);
-        if (listRes === null) {
-          // v6.8.5: storage.list() failing must NOT look like "no data exists" —
-          // that silent conflation is exactly what made past data look deleted
-          setRawFullTableMigrationStatus({
-            type: "error",
-            msg: "アナスロの生データ一覧の取得に失敗しました（storage.listがnullを返しました）。実際のデータは消えていない可能性が高いです、再読み込みしてみてください。",
-          });
-          setRawFullTableLoaded(true);
-          return;
-        }
-        const keys = listRes.keys || [];
-        // v6.8.5: this prefix also matches leftover per-date keys from
-        // v6.8.1〜v6.8.4 (e.g. "...v1:2026-07-06"), which look like month
-        // keys (e.g. "...v1:2026-07") but have 3 extra digits — split them
-        // out so they can be folded into the new month-bucket scheme below
-        // instead of being misread as a malformed month bucket.
-        const monthKeys = keys.filter((k) => /^\d{4}-\d{2}$/.test(k.slice(RAW_FULLTABLE_KEY_PREFIX.length)));
-        const legacyDateKeys = keys.filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k.slice(RAW_FULLTABLE_KEY_PREFIX.length)));
-
+        // v6.8.6: storage.list() is not implemented in this app's actual
+        // storage.js (confirmed by a real "list is not a function" error) —
+        // so month-bucket discovery must never depend on it. Instead,
+        // compute the candidate month keys directly (deterministic key
+        // names) and GET each one; a month with no data just resolves to
+        // null, which is cheap and harmless.
+        const candidateMonths = recentMonthStrings(18); // ~1.5 years back, comfortably covers this store's history
         const monthResults = await Promise.all(
-          monthKeys.map(async (k) => {
+          candidateMonths.map(async (mo) => {
+            const k = `${RAW_FULLTABLE_KEY_PREFIX}${mo}`;
             try {
               const r = await storage.get(k, false);
               if (!r || !r.value) return { key: k, ok: true, data: null };
@@ -1348,43 +1354,16 @@ export default function SlotDataTracker() {
           });
         }
 
-        // v6.8.5 one-time migration: fold any leftover per-date keys
-        // (v6.8.1〜v6.8.4 scheme) AND the original single shared key (v6.8
-        // scheme) into the new month-bucket scheme. Every write is verified
-        // successful before any old key is deleted.
+        // v6.8.1 one-time migration: v6.8 stored every date under ONE shared
+        // key (a fixed, known name — this doesn't need list() to find it).
+        // Fold it into the new month-bucket scheme, verifying every write
+        // succeeds before deleting the legacy key.
+        // Note: any leftover per-date keys from the brief v6.8.1〜v6.8.4
+        // scheme can't be auto-discovered without list() — if some of that
+        // window's data is still missing after this, those specific dates
+        // may need re-entering.
         const monthBuckets = {}; // monthKey -> { date: rows, ... }, only for months touched by this migration
-        const legacySourceKeysToDelete = [];
         let migratedCount = 0;
-
-        try {
-          const legacyDateResults = await Promise.all(
-            legacyDateKeys.map(async (k) => {
-              try {
-                const r = await storage.get(k, false);
-                if (!r || !r.value) return null;
-                const date = k.slice(RAW_FULLTABLE_KEY_PREFIX.length);
-                return { key: k, date, rows: JSON.parse(r.value) };
-              } catch (e) {
-                return null;
-              }
-            })
-          );
-          legacyDateResults.forEach((entry) => {
-            if (!entry) return;
-            if (entry.date in next) {
-              legacySourceKeysToDelete.push(entry.key); // already have this date via a month bucket — just clean up the stray key
-              return;
-            }
-            const mk = rawFullTableMonthKey(entry.date);
-            if (!monthBuckets[mk]) monthBuckets[mk] = { ...(next[mk] || {}) };
-            monthBuckets[mk][entry.date] = entry.rows;
-            next[entry.date] = entry.rows;
-            legacySourceKeysToDelete.push(entry.key);
-            migratedCount += 1;
-          });
-        } catch (e) {
-          // no per-date leftovers to migrate, or unreadable — leave as-is
-        }
 
         try {
           const legacy = await storage.get(LEGACY_RAW_FULLTABLE_KEY, false);
@@ -1401,14 +1380,34 @@ export default function SlotDataTracker() {
             }
             if (legacyData && typeof legacyData === "object") {
               Object.entries(legacyData).forEach(([date, rows]) => {
-                if (date in next) return; // already covered by a month bucket or per-date key
+                if (date in next) return; // already covered by a month bucket
                 const mk = rawFullTableMonthKey(date);
                 if (!monthBuckets[mk]) monthBuckets[mk] = { ...(next[mk] || {}) };
                 monthBuckets[mk][date] = rows;
                 next[date] = rows;
                 migratedCount += 1;
               });
-              legacySourceKeysToDelete.push(LEGACY_RAW_FULLTABLE_KEY);
+              if (migratedCount > 0) {
+                const writeResults = await Promise.all(
+                  Object.keys(monthBuckets).map(async (mk) => {
+                    const res = await storage.set(mk, JSON.stringify(monthBuckets[mk]), false);
+                    return { mk, ok: !!res };
+                  })
+                );
+                const failedWrites = writeResults.filter((r) => !r.ok).map((r) => r.mk);
+                if (failedWrites.length > 0) {
+                  setRawFullTableMigrationStatus({
+                    type: "error",
+                    msg: `旧データの移行中、${failedWrites.length}件の月別キー保存に失敗しました（${failedWrites.join(", ")}）。旧キーは安全のため削除していません。`,
+                  });
+                } else {
+                  await storage.delete(LEGACY_RAW_FULLTABLE_KEY, false);
+                  setRawFullTableMigrationStatus({
+                    type: "ok",
+                    msg: `旧形式のデータを${migratedCount}件、新しい月別キーに移行しました。`,
+                  });
+                }
+              }
             }
           }
         } catch (e) {
@@ -1416,29 +1415,6 @@ export default function SlotDataTracker() {
             type: "error",
             msg: `旧データの確認中にエラーが発生しました：${e && e.message ? e.message : "不明なエラー"}`,
           });
-        }
-
-        const monthBucketKeys = Object.keys(monthBuckets);
-        if (monthBucketKeys.length > 0) {
-          const writeResults = await Promise.all(
-            monthBucketKeys.map(async (mk) => {
-              const res = await storage.set(mk, JSON.stringify(monthBuckets[mk]), false);
-              return { mk, ok: !!res };
-            })
-          );
-          const failedWrites = writeResults.filter((r) => !r.ok).map((r) => r.mk);
-          if (failedWrites.length > 0) {
-            setRawFullTableMigrationStatus({
-              type: "error",
-              msg: `旧データの移行中、${failedWrites.length}件の月別キー保存に失敗しました（${failedWrites.join(", ")}）。旧キーは安全のため削除していません。`,
-            });
-          } else {
-            await Promise.all(legacySourceKeysToDelete.map((k) => storage.delete(k, false)));
-            setRawFullTableMigrationStatus({
-              type: "ok",
-              msg: `旧形式のデータを${migratedCount}件、新しい月別キーに移行しました。`,
-            });
-          }
         }
 
         setRawFullTable(next);
