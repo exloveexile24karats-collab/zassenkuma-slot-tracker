@@ -113,7 +113,10 @@ const DIGIT7_COLOR = "#f6a04d";
 // v6.8.3: v6.8.2の移行処理が失敗を黙って握りつぶしており、実際に移行に
 // 失敗しても画面上は何も表示されない問題があった。移行の結果（成功件数・
 // 失敗内容・JSON解析エラー等）を画面上部に必ずバナー表示するように変更。
-const APP_VERSION = "6.8.3";
+// v6.8.4: 民レポの「登録済みの日付」一覧で日付をクリックした時、民レポ側
+// だけでなくアナスロ側も同じ日付に連動してジャンプ・読み込みされるように
+// 変更（今までアナスロ側は日付ピッカーを別途操作しないと出てこなかった）。
+const APP_VERSION = "6.8.4";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1728,10 +1731,31 @@ export default function SlotDataTracker() {
   // v6.8: clicking an already-registered date reloads it into the edit
   // form (date + textarea) instead of only offering delete — saving over
   // it just overwrites that date's entry as before
+  // v6.8.4: shared by the アナスロ date-picker and by clicking a date in the
+  // 民レポ list — loads that date's アナスロ data (if any) into the paste box
+  const loadFullTableForDate = useCallback(
+    (date) => {
+      setFullTableDate(date);
+      const existing = rawFullTable[date];
+      if (existing && existing.length > 0) {
+        setFullTablePasteText(serializeFullStoreRows(existing));
+        setFullTableStatus({ type: "ok", msg: `${date} は登録済み（${existing.length}台分）です。編集用に読み込みました。` });
+      } else {
+        setFullTablePasteText("");
+        setFullTableStatus({ type: "error", msg: `${date} はまだ未登録です。` });
+      }
+    },
+    [rawFullTable]
+  );
+
+  // v6.8.4: clicking a date in the 民レポ list now jumps BOTH panels to that
+  // date — 民レポ's own edit-load, plus アナスロ's, so either side's status
+  // for that date is visible without switching the date picker separately
   function handleEditOverall(s) {
     setOverallDate(s.date);
     setOverallPasteText(serializeOverallSummary(s));
     setOverallStatus({ type: "ok", msg: `${s.date} のデータを編集用に読み込みました。修正して保存すると上書きされます。` });
+    loadFullTableForDate(s.date);
   }
 
   function handleDeleteAllOverall() {
@@ -4659,18 +4683,7 @@ export default function SlotDataTracker() {
                   <input
                     type="date"
                     value={fullTableDate}
-                    onChange={(e) => {
-                      const newDate = e.target.value;
-                      setFullTableDate(newDate);
-                      const existing = rawFullTable[newDate];
-                      if (existing && existing.length > 0) {
-                        setFullTablePasteText(serializeFullStoreRows(existing));
-                        setFullTableStatus({ type: "ok", msg: `${newDate} は登録済み（${existing.length}台分）です。編集用に読み込みました。` });
-                      } else {
-                        setFullTablePasteText("");
-                        setFullTableStatus(null);
-                      }
-                    }}
+                    onChange={(e) => loadFullTableForDate(e.target.value)}
                     style={{
                       display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
                       borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
