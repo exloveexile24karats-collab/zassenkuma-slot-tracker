@@ -53,6 +53,13 @@ function joinEventNames(names) {
 }
 const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1";
 const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,startDate,endDate,label}]}
+// v6.8: raw per-machine, all-model, whole-store table paste. Independent of
+// whether a page/model is registered yet — this is the source of truth that
+// gets replayed into a page's own history (gsuNormal field) once that
+// model IS registered, and is also the input for the 設定判別 (setting
+// inference) feature for currently-tracked models. Keyed by date:
+// { [date]: [{modelName, no, gsuNormal, sada, bb, rb, gousei, bbRateStr, rbRateStr}] }
+const RAW_FULLTABLE_KEY = "slot-raw-fulltable-v1";
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
 const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
@@ -78,7 +85,12 @@ const DIGIT7_COLOR = "#f6a04d";
 // with three newly backtested signals: 自己平均比ローテーション (self-baseline
 // trend, +5.4pt), イベント名×台番号末尾一致 (+7.7pt page-level), and 凹み上げ
 // (+5.7〜5.9pt). See conversation history for full backtest numbers.
-const APP_VERSION = "6.7";
+// v6.8 (雑餉隈): 機種ごとの個別データ入力を廃止し、店全体・全機種・台番号
+// 単位の一括表貼り付け（通常時G数つき）に一本化。既存の「全体データ」
+// （機種別サマリー）は変更なし。出率（shutsu）概念は廃止し、台番号×日付
+// マトリクスは設定判別プロファイル登録済み機種（モンキーターンV・
+// マイジャグラーV）の設定期待度表示に切り替え。
+const APP_VERSION = "6.8";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -110,51 +122,6 @@ function toAsciiMinus(text) {
   return String(text).replace(/[\u2212\uFF0D\u2010\u2011\u2013\u2014]/g, "-");
 }
 
-function parseTable(text) {
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-
-  const machines = [];
-  for (const line of lines) {
-    if (line.startsWith("台番")) continue; // header row
-    if (line.startsWith("平均")) continue; // average row
-
-    let cols = line.split("\t").map((c) => c.trim());
-    if (cols.length < 7) {
-      cols = line.split(/\s{2,}/).map((c) => c.trim());
-    }
-    if (cols.length < 7) continue;
-
-    const [noStr, sadaStr, gsuStr, shutsuStr, bbStr, rbStr, gouseiStr, bbRateStr, rbRateStr] = cols;
-
-    const no = parseInt(String(noStr).replace(/,/g, ""), 10);
-    if (Number.isNaN(no)) continue;
-
-    const sada = parseInt(toAsciiMinus(sadaStr).replace(/,/g, ""), 10);
-    const gsu = parseInt(toAsciiMinus(gsuStr).replace(/,/g, ""), 10);
-    const shutsu = parseFloat(String(shutsuStr).replace("%", ""));
-    const bb = bbStr === "-" || bbStr === undefined ? null : parseInt(toAsciiMinus(bbStr), 10);
-    const rb = rbStr === "-" || rbStr === undefined ? null : parseInt(toAsciiMinus(rbStr), 10);
-    const gouseiMatch = gouseiStr ? gouseiStr.match(/1\s*\/\s*(\d+)/) : null;
-    const gousei = gouseiMatch ? parseInt(gouseiMatch[1], 10) : null;
-
-    machines.push({
-      no,
-      sada: Number.isNaN(sada) ? null : sada,
-      gsu: Number.isNaN(gsu) ? null : gsu,
-      shutsu: Number.isNaN(shutsu) ? null : shutsu,
-      bb,
-      rb,
-      gousei,
-      bbRateStr: bbRateStr ?? "-",
-      rbRateStr: rbRateStr ?? "-",
-    });
-  }
-  return machines;
-}
-
 function fmtNum(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return "―";
   return v.toLocaleString();
@@ -184,16 +151,6 @@ function markColor(mark) {
   if (mark === "☆" || mark === "◎") return "#e5484d";
   if (mark === "◯") return "#f2d24b";
   return "#9ece6a"; // ▲
-}
-
-// per-MACHINE version of the same idea — an individual machine on a single
-// day doesn't have a "win rate across installed units" (that concept only
-// applies to a model as a whole), so this classifies by 出率 alone
-function classifyMachineMark(m) {
-  if (!m || m.shutsu === null || m.shutsu === undefined) return null;
-  if (m.shutsu >= 110) return "▲";
-  if (m.shutsu >= 105) return "◯";
-  return null;
 }
 
 // parse a store-wide summary table: 機種名(or 末尾)\t平均差枚\t平均G数\t勝率(x/y)\t出率
@@ -251,6 +208,173 @@ function parseOverallSummary(text) {
   const modelText = idx === -1 ? text : text.slice(0, idx);
   const digitText = idx === -1 ? "" : text.slice(idx);
   return { modelRows: parseSummaryTable(modelText), digitRows: parseSummaryTable(digitText) };
+}
+
+// v6.8: parses the whole-store, all-machines, per-number granular table
+// (機種名 台番号 G数 差枚 BB RB 合成確率 BB確率 RB確率 — this G数 is 通常時G数,
+// distinct from the per-page 総G数 already tracked elsewhere). One row per
+// physical machine, every model in the store in a single paste.
+function parseFullStoreTable(text) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const rows = [];
+  for (const line of lines) {
+    if (line.startsWith("機種名") && line.includes("台番号")) continue; // header row
+    const cols = line.split("\t").map((c) => c.trim());
+    if (cols.length < 7) continue;
+    const [modelName, noStr, gsuStr, sadaStr, bbStr, rbStr, gouseiStr, bbRateStr, rbRateStr] = cols;
+    const no = parseInt(String(noStr).replace(/,/g, ""), 10);
+    if (Number.isNaN(no) || !modelName) continue;
+    const gsuNormal = parseInt(toAsciiMinus(gsuStr).replace(/,/g, ""), 10);
+    const sada = parseInt(toAsciiMinus(sadaStr).replace(/,/g, ""), 10);
+    const bb = bbStr === "-" || bbStr === undefined ? null : parseInt(toAsciiMinus(bbStr), 10);
+    const rb = rbStr === "-" || rbStr === undefined ? null : parseInt(toAsciiMinus(rbStr), 10);
+    const gouseiMatch = gouseiStr ? gouseiStr.match(/1\s*\/\s*([\d.]+)/) : null;
+    const gousei = gouseiMatch ? parseFloat(gouseiMatch[1]) : null;
+    rows.push({
+      modelName: modelName.trim(),
+      no,
+      gsuNormal: Number.isNaN(gsuNormal) ? null : gsuNormal,
+      sada: Number.isNaN(sada) ? null : sada,
+      bb: bb !== null && Number.isNaN(bb) ? null : bb,
+      rb: rb !== null && Number.isNaN(rb) ? null : rb,
+      gousei,
+      bbRateStr: bbRateStr ?? "-",
+      rbRateStr: rbRateStr ?? "-",
+    });
+  }
+  return rows;
+}
+
+// v6.8: 機種名の表記ゆれを軽く吸収する（"スマスロ"/"S"/"L" などの機種名接頭辞の
+// 有無だけを無視した緩い一致）。完全一致優先、ダメなら接頭辞を落として再比較。
+function normalizeModelNameForMatch(name) {
+  return (name || "").replace(/^(スマスロ|Sマイ|パチスロ|[SL])\s*/u, "").trim();
+}
+function modelNamesMatch(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return normalizeModelNameForMatch(a) === normalizeModelNameForMatch(b);
+}
+
+// v6.8 SETTING INFERENCE (設定判別) — deliberately scoped to only the
+// machine models we've actually confirmed theoretical per-setting tables
+// for, rather than guessing at unverified numbers (wrong tables would give
+// confidently-wrong setting suggestions, which is worse than no signal).
+// Each profile knows its own "type" (AT-type vs A-type) and how to score
+// an observed (bb, rb, gsuNormal) triple against its table.
+const SETTING_PROFILES = {
+  "スマスロモンキーターンV": {
+    type: "AT",
+    // AT初当たり確率（RB＝初当たり回数として扱う）。ユーザー提供の実測値。
+    // 確率が重い（サンプルが少ないとブレが大きい）ため、単独の閾値判定では
+    // なくグラデーション（尤度ベース）で扱い、差枚トレンドと合わせて評価する
+    atHitTable: [
+      { setting: 1, rate: 1 / 299.8 },
+      { setting: 2, rate: 1 / 295.5 },
+      { setting: 4, rate: 1 / 258.8 },
+      { setting: 5, rate: 1 / 235.7 },
+      { setting: 6, rate: 1 / 222.9 },
+    ],
+  },
+  マイジャグラーV: {
+    type: "A",
+    // 合成確率（BB+RB）とREG(RB)確率の設定差テーブル。ユーザー提供の解析値。
+    combinedTable: [
+      { setting: 1, rate: 1 / 163.8 },
+      { setting: 2, rate: 1 / 159.1 },
+      { setting: 3, rate: 1 / 148.6 },
+      { setting: 4, rate: 1 / 135.4 },
+      { setting: 5, rate: 1 / 126.8 },
+      { setting: 6, rate: 1 / 114.6 },
+    ],
+    rbTable: [
+      { setting: 1, rate: 1 / 409.6 },
+      { setting: 2, rate: 1 / 385.5 },
+      { setting: 3, rate: 1 / 336.1 },
+      { setting: 4, rate: 1 / 290.0 },
+      { setting: 5, rate: 1 / 268.6 },
+      { setting: 6, rate: 1 / 229.1 },
+    ],
+  },
+};
+
+// Poisson log-likelihood of observing `count` hits over `n` trials if the
+// true per-trial rate were `rate` — used to compare how well each candidate
+// setting's theoretical rate explains what we actually saw, without needing
+// a hard pass/fail threshold (this IS the "gradation" the person asked for)
+function poissonLogLikelihood(count, n, rate) {
+  const lambda = n * rate;
+  if (lambda <= 0) return count === 0 ? 0 : -Infinity;
+  // log P(count; lambda) = count*log(lambda) - lambda - log(count!)
+  let logFactorial = 0;
+  for (let k = 2; k <= count; k++) logFactorial += Math.log(k);
+  return count * Math.log(lambda) - lambda - logFactorial;
+}
+
+// turns a table of {setting, rate} + an observation into a 0-1 "confidence
+// toward high settings" score: softmax over the per-setting likelihoods,
+// then a weighted average of setting number (normalized to 0-1 across the
+// table's min/max setting) — smooth/graduated by construction, not a cliff
+function settingLikelihoodScore(table, count, n) {
+  if (!n || n < 300) return null; // too little play to say anything meaningful yet
+  const logLiks = table.map((t) => ({ setting: t.setting, ll: poissonLogLikelihood(count, n, t.rate) }));
+  const maxLL = Math.max(...logLiks.map((l) => l.ll));
+  const weights = logLiks.map((l) => ({ setting: l.setting, w: Math.exp(l.ll - maxLL) }));
+  const totalW = weights.reduce((a, w) => a + w.w, 0);
+  if (!totalW) return null;
+  const settings = table.map((t) => t.setting);
+  const minS = Math.min(...settings);
+  const maxS = Math.max(...settings);
+  const expectedSetting = weights.reduce((a, w) => a + (w.w / totalW) * w.setting, 0);
+  const normalized = maxS > minS ? (expectedSetting - minS) / (maxS - minS) : 0.5;
+  return { expectedSetting, normalized, sampleSize: n };
+}
+
+// combined per-machine 設定期待度 (0-1, higher = more likely a good setting),
+// dispatched by the machine's model profile type. Returns null for
+// unprofiled models (falls back to the existing win-rate-based signals only)
+function evaluateSettingLikelihood(officialModelName, observation) {
+  const profile = SETTING_PROFILES[officialModelName];
+  if (!profile) return null;
+  const { bb, rb, gsuNormal, recentSadaTrend } = observation;
+  if (gsuNormal === null || gsuNormal === undefined) return null;
+
+  if (profile.type === "AT") {
+    // RB = AT初当たり回数. Confidence is graded down further (extra
+    // shrinkage toward 0.5) because hit-rate alone is noisy for a
+    // heavy/rare-hit machine — 差枚トレンドを合わせて最終スコアにする
+    if (rb === null || rb === undefined) return null;
+    const hitScore = settingLikelihoodScore(profile.atHitTable, rb, gsuNormal);
+    if (!hitScore) return null;
+    // shrink toward 0.5 (neutral) to reflect the higher variance of a rare event
+    const shrunk = 0.5 + (hitScore.normalized - 0.5) * 0.6;
+    let combined = shrunk;
+    if (typeof recentSadaTrend === "number") {
+      // recentSadaTrend expected pre-normalized to roughly [-1, 1]
+      const trendComponent = Math.max(0, Math.min(1, 0.5 + recentSadaTrend * 0.5));
+      combined = shrunk * 0.6 + trendComponent * 0.4;
+    }
+    return { score: combined, expectedSetting: hitScore.expectedSetting, sampleSize: gsuNormal, basis: "AT初当たり＋差枚トレンド" };
+  }
+
+  if (profile.type === "A") {
+    if (bb === null || rb === null || bb === undefined || rb === undefined) return null;
+    const combinedScore = settingLikelihoodScore(profile.combinedTable, bb + rb, gsuNormal);
+    const rbScore = settingLikelihoodScore(profile.rbTable, rb, gsuNormal);
+    if (!combinedScore && !rbScore) return null;
+    // A-type (juggler-style) hit rates are frequent enough to trust more
+    // directly than the AT case — no extra shrinkage needed
+    const parts = [combinedScore, rbScore].filter(Boolean);
+    const score = parts.reduce((a, p) => a + p.normalized, 0) / parts.length;
+    const expectedSetting = parts.reduce((a, p) => a + p.expectedSetting, 0) / parts.length;
+    return { score, expectedSetting, sampleSize: gsuNormal, basis: "合成確率＋RB確率" };
+  }
+
+  return null;
 }
 
 // Build (trailing N-day total, next day's differential) pairs from a
@@ -959,6 +1083,19 @@ export default function SlotDataTracker() {
   const [confirmDeleteOverall, setConfirmDeleteOverall] = useState(null);
   const [confirmDeleteAllOverall, setConfirmDeleteAllOverall] = useState(false);
 
+  // ---- v6.8: whole-store, per-machine granular table (機種名/台番号/通常時G数/
+  // 差枚/BB/RB/合成確率). This is now the SOLE source for page histories
+  // (replaces the old per-page single-machine paste) and for 設定判別.
+  // Stored raw, keyed by date, independent of which pages exist yet — so
+  // a not-yet-registered model's data isn't lost and can be backfilled
+  // once its page is created. ----
+  const [rawFullTable, setRawFullTable] = useState({}); // { [date]: [{modelName,no,gsuNormal,sada,bb,rb,gousei,bbRateStr,rbRateStr}] }
+  const [rawFullTableLoaded, setRawFullTableLoaded] = useState(false);
+  const [fullTableDate, setFullTableDate] = useState(todayStr());
+  const [fullTablePasteText, setFullTablePasteText] = useState("");
+  const [fullTableStatus, setFullTableStatus] = useState(null);
+
+
   // ---- undo history: snapshots taken right before a destructive action,
   //      so any reset/delete can be reversed with one click. shown as a
   //      fixed panel regardless of which tab/page is currently open ----
@@ -967,7 +1104,6 @@ export default function SlotDataTracker() {
   const [undoPanelOpen, setUndoPanelOpen] = useState(false);
 
   // ---- per-page form / view state ----
-  const [pasteText, setPasteText] = useState("");
   const [entryDate, setEntryDate] = useState(todayStr());
   const [status, setStatus] = useState(null);
   const [selectedMachines, setSelectedMachines] = useState([]);
@@ -1082,6 +1218,17 @@ export default function SlotDataTracker() {
         setOverallSummariesLoaded(true);
       }
       try {
+        const r6b = await storage.get(RAW_FULLTABLE_KEY, false);
+        if (r6b && r6b.value) {
+          const val = JSON.parse(r6b.value);
+          if (val && typeof val === "object") setRawFullTable(val);
+        }
+      } catch (e) {
+        // none yet
+      } finally {
+        setRawFullTableLoaded(true);
+      }
+      try {
         const r7 = await storage.get(UNDO_HISTORY_KEY, false);
         if (r7 && r7.value) {
           const val = JSON.parse(r7.value);
@@ -1171,6 +1318,8 @@ export default function SlotDataTracker() {
     }
   }, []);
 
+  const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
+
   const persistPageHistory = useCallback(async (pageId, next) => {
     setPageHistories((prev) => ({ ...prev, [pageId]: next }));
     try {
@@ -1180,6 +1329,99 @@ export default function SlotDataTracker() {
       setStatus({ type: "error", msg: "保存中にエラーが発生しました。" });
     }
   }, []);
+
+  // v6.8: the whole-store bulk paste is now the only way data enters a
+  // page's history. One save (1) stores every row as raw data (so a model
+  // without a page yet isn't lost — see 機種登録時のバックフィル below),
+  // and (2) fans out into every EXISTING page whose 正式名称 matches a
+  // row's 機種名, replacing that page's entry for this date.
+  const handleSaveFullTable = useCallback(async () => {
+    if (closedDateSet.has(fullTableDate)) {
+      setFullTableStatus({ type: "error", msg: `${fullTableDate} は店休日として登録されているため、データを保存できません。` });
+      return;
+    }
+    const rows = parseFullStoreTable(fullTablePasteText);
+    if (rows.length === 0) {
+      setFullTableStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
+      return;
+    }
+    // 1. persist raw, keyed by date (overwrites this date's prior paste, if any)
+    const nextRaw = { ...rawFullTable, [fullTableDate]: rows };
+    setRawFullTable(nextRaw);
+    try {
+      await storage.set(RAW_FULLTABLE_KEY, JSON.stringify(nextRaw), false);
+    } catch (e) {
+      setFullTableStatus({ type: "error", msg: "生データの保存中にエラーが発生しました。" });
+      return;
+    }
+
+    // 2. fan out into every page whose 正式名称 matches a 機種名 in this paste
+    const autoEvent = (dateEventMap[fullTableDate] || "").trim();
+    let updatedPageCount = 0;
+    for (const page of pages) {
+      if (!page.officialName) continue;
+      const matched = rows.filter((r) => modelNamesMatch(r.modelName, page.officialName));
+      if (matched.length === 0) continue;
+      const machines = matched.map((r) => ({
+        no: r.no,
+        sada: r.sada,
+        gsu: r.gsuNormal, // v6.8: this is 通常時G数, NOT the old AT込み総G数
+        shutsu: null, // 出率概念は廃止 — 通常時G数だけでは総投入枚数が出せないため
+        bb: r.bb,
+        rb: r.rb,
+        gousei: r.gousei,
+        bbRateStr: r.bbRateStr,
+        rbRateStr: r.rbRateStr,
+      }));
+      const existingHistory = pageHistories[page.id] || [];
+      const nextHistory = [...existingHistory.filter((h) => h.date !== fullTableDate), { date: fullTableDate, event: autoEvent, machines }];
+      await persistPageHistory(page.id, nextHistory);
+      updatedPageCount += 1;
+    }
+
+    setFullTableStatus({
+      type: "ok",
+      msg: `${fullTableDate} のデータを保存しました（全${rows.length}台分、うち${updatedPageCount}ページに反映）。`,
+    });
+    setFullTablePasteText("");
+    setFullTableDate(addDays(fullTableDate, -1));
+  }, [fullTablePasteText, fullTableDate, rawFullTable, pages, pageHistories, dateEventMap, closedDateSet, persistPageHistory]);
+
+  // v6.8: called when a NEW page is registered (or an existing page's
+  // 正式名称 is set/changed) — replays every raw day already collected for
+  // a matching 機種名 into that page's history, so a model doesn't have to
+  // wait for new pastes once it's finally given a page
+  const backfillPageFromRawTable = useCallback(
+    async (pageId, officialName) => {
+      if (!officialName) return;
+      const dates = Object.keys(rawFullTable).sort();
+      if (dates.length === 0) return;
+      const existingHistory = pageHistories[pageId] || [];
+      const byDate = new Map(existingHistory.map((h) => [h.date, h]));
+      dates.forEach((date) => {
+        if (byDate.has(date)) return; // never overwrite an existing entry for this page
+        const rows = rawFullTable[date] || [];
+        const matched = rows.filter((r) => modelNamesMatch(r.modelName, officialName));
+        if (matched.length === 0) return;
+        const machines = matched.map((r) => ({
+          no: r.no,
+          sada: r.sada,
+          gsu: r.gsuNormal,
+          shutsu: null,
+          bb: r.bb,
+          rb: r.rb,
+          gousei: r.gousei,
+          bbRateStr: r.bbRateStr,
+          rbRateStr: r.rbRateStr,
+        }));
+        const autoEvent = (dateEventMap[date] || "").trim();
+        byDate.set(date, { date, event: autoEvent, machines });
+      });
+      const next = Array.from(byDate.values()).sort((a, b) => (a.date < b.date ? -1 : 1));
+      await persistPageHistory(pageId, next);
+    },
+    [rawFullTable, pageHistories, dateEventMap, persistPageHistory]
+  );
 
   const persistPageRecommends = useCallback(async (pageId, next) => {
     setPageRecommends((prev) => ({ ...prev, [pageId]: next }));
@@ -1438,6 +1680,9 @@ export default function SlotDataTracker() {
 
   function handleSetOfficialName(pageId, officialName) {
     persistPages(pages.map((p) => (p.id === pageId ? { ...p, officialName } : p)));
+    // v6.8: registering/renaming a page's 正式名称 immediately replays any
+    // already-collected raw whole-store data for that model into this page
+    if (officialName) backfillPageFromRawTable(pageId, officialName);
   }
 
   function handleDeletePage(pageId) {
@@ -1513,8 +1758,6 @@ export default function SlotDataTracker() {
   }, [currentHistory]);
 
   const entryDateHasExisting = !!historyByDate[entryDate];
-
-  const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
 
   // this PAGE's own recommend periods, for its own machines' predictions
   const recommendDateSet = useMemo(() => {
@@ -2445,16 +2688,37 @@ export default function SlotDataTracker() {
     return Array.from(nos).sort((a, b) => a - b);
   }, [sortedHistory]);
 
+  // v6.8: 出率（shutsu）ベースの☆◎◯▲マークは廃止。プロファイル登録済みの
+  // 機種（今のところモンキーターンV・マイジャグラーVのみ）は、代わりに
+  // 設定期待度（0-1）をグラデーション表示する。評価の色分け・粒度は今後
+  // 調整予定 — ここでは「高いほど緑寄り、低いほど赤寄り」の暫定表示。
+  // 未プロファイルの機種は空欄のまま（無理に代替指標を出さない）。
   const pageGridMarks = useMemo(() => {
     const map = {};
+    const officialName = currentPage && currentPage.officialName;
+    const profileExists = officialName && SETTING_PROFILES[officialName];
     sortedHistory.forEach((h) => {
       h.machines.forEach((m) => {
         if (!map[m.no]) map[m.no] = {};
-        map[m.no][h.date] = classifyMachineMark(m);
+        if (!profileExists) {
+          map[m.no][h.date] = null;
+          return;
+        }
+        const result = evaluateSettingLikelihood(officialName, { bb: m.bb, rb: m.rb, gsuNormal: m.gsu });
+        if (!result) {
+          map[m.no][h.date] = null;
+          return;
+        }
+        const pct = Math.round(result.score * 100);
+        // green (high) <-> gray (mid) <-> red (low), interpolated
+        const color = result.score >= 0.5
+          ? `rgb(${Math.round(199 - (result.score - 0.5) * 2 * (199 - 158))}, ${Math.round(203 + (result.score - 0.5) * 2 * (206 - 203))}, ${Math.round(203 - (result.score - 0.5) * 2 * 100)})`
+          : `rgb(${Math.round(199 + (0.5 - result.score) * 2 * (229 - 199))}, ${Math.round(203 - (0.5 - result.score) * 2 * 100)}, ${Math.round(203 - (0.5 - result.score) * 2 * 90)})`;
+        map[m.no][h.date] = { label: String(pct), color };
       });
     });
     return map;
-  }, [sortedHistory]);
+  }, [sortedHistory, currentPage]);
 
   const overallModelPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
@@ -2567,62 +2831,9 @@ export default function SlotDataTracker() {
     return results.slice(0, 20);
   }, [allMachineNumbers, sortedHistory]);
 
-  function handleSave() {
-    if (!activePageId) return;
-    if (closedDateSet.has(entryDate)) {
-      setStatus({ type: "error", msg: `${entryDate} は店休日として登録されているため、データを保存できません。` });
-      return;
-    }
-    const parsedMachines = parseTable(pasteText);
-    if (parsedMachines.length === 0) {
-      setStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
-      return;
-    }
-    if (!entryDate) {
-      setStatus({ type: "error", msg: "日付を入力してください。" });
-      return;
-    }
-    // event text is no longer typed here — it's pulled automatically from
-    // the shared date→event registry (managed in the "イベント登録" panel),
-    // so every page always stays in sync with zero extra steps
-    const autoEvent = (dateEventMap[entryDate] || "").trim();
-    const next = [
-      ...currentHistory.filter((h) => h.date !== entryDate),
-      { date: entryDate, event: autoEvent, machines: parsedMachines },
-    ];
-    persistPageHistory(activePageId, next);
-    setStatus({
-      type: "ok",
-      msg: `${entryDate} のデータを保存しました（${parsedMachines.length}台分）。`,
-    });
-    setPasteText("");
-    setEntryDate(addDays(entryDate, -1));
-  }
-
   function handleDeleteDate(date) {
     persistPageHistory(activePageId, currentHistory.filter((h) => h.date !== date));
     setConfirmDeleteDate(null);
-  }
-
-  // reload an already-saved day's data into the form so a typo can be fixed and re-saved
-  function handleEditDate(h) {
-    const header = "台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率";
-    const rows = h.machines.map((m) =>
-      [
-        m.no,
-        m.sada === null ? "" : m.sada,
-        m.gsu === null ? "" : m.gsu,
-        (m.shutsu === null ? "" : m.shutsu.toFixed(1)) + "%",
-        m.bb === null ? "-" : m.bb,
-        m.rb === null ? "-" : m.rb,
-        m.gousei === null ? "-" : "1/" + m.gousei,
-        m.bbRateStr || "-",
-        m.rbRateStr || "-",
-      ].join("\t")
-    );
-    setPasteText([header, ...rows].join("\n"));
-    setEntryDate(h.date);
-    setStatus({ type: "ok", msg: `${h.date} のデータを編集用に読み込みました。修正して保存すると上書きされます。` });
   }
 
   function handleResetAll() {
@@ -2977,9 +3188,12 @@ export default function SlotDataTracker() {
                 </td>
                 {dates.map((d) => {
                   const mark = marksMap[row] && marksMap[row][d];
+                  const isObjectMark = mark && typeof mark === "object";
+                  const label = isObjectMark ? mark.label : mark;
+                  const color = isObjectMark ? mark.color : mark ? markColor(mark) : "#2a323f";
                   return (
-                    <td key={d} className="mono" style={{ padding: "4px 3px", textAlign: "center", color: mark ? markColor(mark) : "#2a323f", borderBottom: "1px solid #1c2129" }}>
-                      {mark || "・"}
+                    <td key={d} className="mono" style={{ padding: "4px 3px", textAlign: "center", color, borderBottom: "1px solid #1c2129" }}>
+                      {label || "・"}
                     </td>
                   );
                 })}
@@ -4263,6 +4477,53 @@ export default function SlotDataTracker() {
                 </div>
               )}
 
+              <div style={{ marginTop: "20px", borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
+                <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+                  🗂 全体入力（一括貼り付け・v6.8）
+                </div>
+                <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+                  機種名・台番号・G数（通常時）・差枚・BB・RB・合成確率・BB確率・RB確率の一覧表を、店全体分まとめて貼り付けます。正式名称が一致するページ全部に自動反映されます（機種ごとの個別入力は廃止しました）。G数は通常時のみのため、出率（☆◎◯▲マーク）はこの経路では計算されません。
+                </div>
+                <div style={{ marginBottom: "10px" }}>
+                  <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
+                  <input
+                    type="date"
+                    value={fullTableDate}
+                    onChange={(e) => setFullTableDate(e.target.value)}
+                    style={{
+                      display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                      borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
+                    }}
+                  />
+                </div>
+                <textarea
+                  className="mono scrollbar"
+                  value={fullTablePasteText}
+                  onChange={(e) => setFullTablePasteText(e.target.value)}
+                  placeholder={"機種名\t台番号\tG数\t差枚\tBB\tRB\t合成確率\tBB確率\tRB確率\nモンキーターンV\t185\t4,318\t169\t40\t15\t1/78.5\t1/108.0\t1/287.9\n..."}
+                  rows={10}
+                  style={{
+                    width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
+                    padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
+                    boxSizing: "border-box", marginBottom: "10px",
+                  }}
+                />
+                <button
+                  onClick={handleSaveFullTable}
+                  style={{
+                    width: "100%", background: "#4fd1c5", color: "#0b1f1c", border: "none", borderRadius: "8px",
+                    padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                  }}
+                >
+                  この日の一括データを保存
+                </button>
+                {fullTableStatus && (
+                  <div style={{ marginTop: "8px", fontSize: "11px", color: fullTableStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                    {fullTableStatus.msg}
+                  </div>
+                )}
+              </div>
+
               <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
                   <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
@@ -4482,40 +4743,12 @@ export default function SlotDataTracker() {
               </div>
             )}
 
-            <div style={{ marginBottom: "10px" }}>
-              <label style={{ fontSize: "11px", color: "#8b93a3" }}>
-                表を貼り付け（台番／差枚／G数／出率／BB／RB／合成／BB率／RB率）
-              </label>
-              <textarea
-                className="mono scrollbar"
-                value={pasteText}
-                onChange={(e) => setPasteText(e.target.value)}
-                placeholder={"台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n351\t1,581\t6,432\t108.2%\t0\t16\t1/402\t-\t1/402"}
-                rows={10}
-                style={{
-                  width: "100%", marginTop: "4px", background: "#0e1218", border: "1px solid #2a323f",
-                  borderRadius: "6px", padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5,
-                  resize: "vertical", boxSizing: "border-box",
-                }}
-              />
+            <div style={{
+              fontSize: "12px", color: "#8b93a3", padding: "12px", background: "#12161d",
+              border: "1px solid #2a323f", borderRadius: "8px", lineHeight: 1.6,
+            }}>
+              v6.8より、機種ごとの個別入力は廃止しました。データは「📊 全体データ」タブの「🗂 全体入力（一括貼り付け）」から、店全体の一括表を貼り付けることで、このページを含む全ページに自動で反映されます。
             </div>
-
-            <button
-              onClick={handleSave}
-              disabled={entryDateIsClosed}
-              style={{
-                width: "100%",
-                background: entryDateIsClosed ? "#3a3f4a" : "#e8b34c",
-                color: entryDateIsClosed ? "#8b93a3" : "#1b1508",
-                border: "none", borderRadius: "8px",
-                padding: "10px", fontWeight: 700, fontSize: "13px",
-                cursor: entryDateIsClosed ? "not-allowed" : "pointer",
-                display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
-              }}
-            >
-              <Save size={15} />
-              {entryDateIsClosed ? "店休日のため保存できません" : "この日のデータを保存"}
-            </button>
 
             {status && (
               <div style={{
@@ -4579,9 +4812,6 @@ export default function SlotDataTracker() {
                       </div>
                     ) : (
                       <div style={{ display: "flex", gap: "10px" }}>
-                        <button onClick={() => handleEditDate(h)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この日のデータを編集">
-                          <Pencil size={13} />
-                        </button>
                         <button onClick={() => setConfirmDeleteDate(h.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この日のデータを削除">
                           <Trash2 size={13} />
                         </button>
@@ -4665,7 +4895,7 @@ export default function SlotDataTracker() {
               📋 台番号×日付マトリクス表
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              このページの台番号ごとに、日付ごとの出率ベースの簡易マーク（▲＝出率110%以上・◯＝出率105%以上）を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
+              このページの台番号ごとに、日付ごとの数値を一覧表示します（v6.8より出率ベースの簡易マークは廃止）。設定判別プロファイルが登録済みの機種（モンキーターンV・マイジャグラーV）は設定期待度（0〜100、高いほど緑）を表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
             </div>
             {renderEventMultiSelect(pageGridEventFilter, setPageGridEventFilter)}
             {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => `${no}番`)}
