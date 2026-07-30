@@ -59,34 +59,25 @@ const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,s
 // model IS registered, and is also the input for the 設定判別 (setting
 // inference) feature for currently-tracked models. Keyed by date:
 // { [date]: [{modelName, no, gsuNormal, sada, bb, rb, gousei, bbRateStr, rbRateStr}] }
-// v6.8.5: per-DATE keys (v6.8.1) meant loading fired ~90 concurrent GET
-// requests for a season's worth of data — likely hitting a rate limit or
-// otherwise failing silently, which looked exactly like "data disappeared"
-// even when nothing was actually deleted. Grouped by MONTH instead: still
-// keeps any single key's payload small (a month's worth, not a season's),
-// but a 3-month history now needs ~3 keys instead of ~90.
+// v6.8.11: the real constraint (confirmed by an actual Firestore error,
+// "value longer than 1048487 bytes") is ~1MB per field value — v6.8.5's
+// assumption of a ~5MB ceiling was wrong. A month's worth of whole-store
+// data (300+ machines × ~30 days) is ~1.8MB, comfortably over the real
+// limit. Back to one key PER DAY (a day is ~60KB, safely under 1MB), paired
+// with a small INDEX key listing which dates exist, so loading never needs
+// storage.list() (unavailable here) or blind probing across many months.
 const RAW_FULLTABLE_KEY_PREFIX = "slot-raw-fulltable-v1:";
-// v6.8 used this single key for ALL dates before the v6.8.1 per-date split.
-// v6.8.1-6.8.4 then used "slot-raw-fulltable-v1:" + one date per key. Both
-// are kept only so the one-time migration below can recover leftover data.
+const RAW_FULLTABLE_INDEX_KEY = "slot-raw-fulltable-index-v1"; // JSON array of "YYYY-MM-DD" strings
+// v6.8 used this single key for ALL dates before the per-key split.
+// v6.8.1-6.8.4 then used this same "slot-raw-fulltable-v1:"+date naming,
+// just without an index — so those keys are already directly reusable,
+// they just need to be discovered once and added to the new index.
 const LEGACY_RAW_FULLTABLE_KEY = "slot-raw-fulltable-v1";
 function monthOf(date) {
   return (date || "").slice(0, 7); // "2026-07-06" -> "2026-07"
 }
-function rawFullTableMonthKey(date) {
-  return `${RAW_FULLTABLE_KEY_PREFIX}${monthOf(date)}`;
-}
-// v6.8.6: generates the last `count` months as "YYYY-MM" strings (including
-// the current month), used to probe for month-bucket keys directly via GET
-// since storage.list() isn't available in this app's real storage.js
-function recentMonthStrings(count) {
-  const out = [];
-  const now = new Date();
-  for (let i = 0; i < count; i++) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
-  }
-  return out;
+function rawFullTableDateKey(date) {
+  return `${RAW_FULLTABLE_KEY_PREFIX}${date}`;
 }
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
@@ -174,7 +165,18 @@ const DIGIT7_COLOR = "#f6a04d";
 // 更。失敗時は次の同月保存を汚染しないようref側も元に戻す。あわせて
 // エラーメッセージに実際の例外内容を含めるようにし、原因の切り分けをし
 // やすくした。
-const APP_VERSION = "6.8.10";
+// v6.8.11: v6.8.10で表示された実際のエラー内容から、本当の制限が判明。
+// Firestoreの1フィールドあたり約1MB（1,048,487バイト）が実際の上限で、
+// v6.8.5で想定していた「約5MB」は誤りだった。機種数×日数をまとめる月別
+// キー方式は、1ヶ月分（約1.8MB）で普通に上限を超える。日ごとの個別キー
+// （1日で約60KB、安全に上限内）に戻しつつ、どの日付が存在するかを管理
+// する小さな索引キーを別途持たせることで、storage.list()無しでも高速に
+// 読み込めるようにした。索引キー自体の競合状態（v6.8.9と同種の問題）に
+// ついても、ref+キューで対策し、ランダム遅延を模したテストで確認済み。
+// 索引がまだ無い場合（過去の旧形式のみが残っている状況）は、民レポの
+// 日付一覧を手がかりに、対応する日付キー・単一旧キーの両方から復元する
+// 一回限りのブートストラップ処理も実装。
+const APP_VERSION = "6.8.11";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1231,14 +1233,13 @@ export default function SlotDataTracker() {
   // which is racy against a save that hasn't committed yet) is what
   // actually fixes the "middle dates disappear" lost-update bug.
   const rawFullTableRef = useRef({});
-  // v6.8.9: per-month-key write queue — even with rawFullTableRef always
-  // holding the fullest merged state, concurrent storage.set() calls for
-  // the SAME month could still complete OUT OF ORDER (whichever finishes
-  // last wins, and an earlier/smaller snapshot finishing last would still
-  // clobber a later/fuller one). Chaining each month's writes strictly
-  // after the previous one for that month closes this gap — verified with
-  // a randomized-latency stress test before shipping.
-  const rawFullTableWriteQueueRef = useRef({});
+  // v6.8.11: with per-day keys again, each individual date's write no
+  // longer shares a key with other dates, so the same-key write-race from
+  // v6.8.9 doesn't apply to date data itself anymore. It DOES still apply
+  // to the single shared INDEX key (which lists which dates exist) — so
+  // that one still needs the ref+queue treatment.
+  const rawFullTableIndexRef = useRef([]); // current known list of dates, kept in lockstep with storage
+  const rawFullTableIndexWriteQueueRef = useRef(Promise.resolve()); // single queue, since there's only one index key
   const [rawFullTableLoaded, setRawFullTableLoaded] = useState(false);
   const [rawFullTableMigrationStatus, setRawFullTableMigrationStatus] = useState(null);
   const [fullTableDate, setFullTableDate] = useState(todayStr());
@@ -1368,102 +1369,141 @@ export default function SlotDataTracker() {
         setOverallSummariesLoaded(true);
       }
       try {
-        // v6.8.6: storage.list() is not implemented in this app's actual
-        // storage.js (confirmed by a real "list is not a function" error) —
-        // so month-bucket discovery must never depend on it. Instead,
-        // compute the candidate month keys directly (deterministic key
-        // names) and GET each one; a month with no data just resolves to
-        // null, which is cheap and harmless.
-        const candidateMonths = recentMonthStrings(18); // ~1.5 years back, comfortably covers this store's history
-        const monthResults = await Promise.all(
-          candidateMonths.map(async (mo) => {
-            const k = `${RAW_FULLTABLE_KEY_PREFIX}${mo}`;
-            try {
-              const r = await storage.get(k, false);
-              if (!r || !r.value) return { key: k, ok: true, data: null };
-              return { key: k, ok: true, data: JSON.parse(r.value) };
-            } catch (e) {
-              return { key: k, ok: false, error: e };
-            }
-          })
-        );
-        const next = {};
-        const failedMonthKeys = [];
-        monthResults.forEach((m) => {
-          if (!m.ok) {
-            failedMonthKeys.push(m.key);
-            return;
-          }
-          if (m.data && typeof m.data === "object") Object.assign(next, m.data);
-        });
-        if (failedMonthKeys.length > 0) {
-          setRawFullTableMigrationStatus({
-            type: "error",
-            msg: `アナスロの一部データ（${failedMonthKeys.join(", ")}）の読み込みに失敗しました。ページを再読み込みしてみてください。`,
-          });
-        }
-
-        // v6.8.1 one-time migration: v6.8 stored every date under ONE shared
-        // key (a fixed, known name — this doesn't need list() to find it).
-        // Fold it into the new month-bucket scheme, verifying every write
-        // succeeds before deleting the legacy key.
-        // Note: any leftover per-date keys from the brief v6.8.1〜v6.8.4
-        // scheme can't be auto-discovered without list() — if some of that
-        // window's data is still missing after this, those specific dates
-        // may need re-entering.
-        const monthBuckets = {}; // monthKey -> { date: rows, ... }, only for months touched by this migration
-        let migratedCount = 0;
-
+        let knownDates = null;
         try {
-          const legacy = await storage.get(LEGACY_RAW_FULLTABLE_KEY, false);
-          if (legacy && legacy.value) {
-            let legacyData;
-            try {
-              legacyData = JSON.parse(legacy.value);
-            } catch (parseErr) {
-              setRawFullTableMigrationStatus({
-                type: "error",
-                msg: `旧データの読み込みに失敗しました（JSON解析エラー：${parseErr.message}）。旧キー "${LEGACY_RAW_FULLTABLE_KEY}" のデータはまだ削除されていません。`,
-              });
-              legacyData = null;
-            }
-            if (legacyData && typeof legacyData === "object") {
-              Object.entries(legacyData).forEach(([date, rows]) => {
-                if (date in next) return; // already covered by a month bucket
-                const mk = rawFullTableMonthKey(date);
-                if (!monthBuckets[mk]) monthBuckets[mk] = { ...(next[mk] || {}) };
-                monthBuckets[mk][date] = rows;
-                next[date] = rows;
-                migratedCount += 1;
-              });
-              if (migratedCount > 0) {
-                const writeResults = await Promise.all(
-                  Object.keys(monthBuckets).map(async (mk) => {
-                    const res = await storage.set(mk, JSON.stringify(monthBuckets[mk]), false);
-                    return { mk, ok: !!res };
-                  })
-                );
-                const failedWrites = writeResults.filter((r) => !r.ok).map((r) => r.mk);
-                if (failedWrites.length > 0) {
-                  setRawFullTableMigrationStatus({
-                    type: "error",
-                    msg: `旧データの移行中、${failedWrites.length}件の月別キー保存に失敗しました（${failedWrites.join(", ")}）。旧キーは安全のため削除していません。`,
-                  });
-                } else {
-                  await storage.delete(LEGACY_RAW_FULLTABLE_KEY, false);
-                  setRawFullTableMigrationStatus({
-                    type: "ok",
-                    msg: `旧形式のデータを${migratedCount}件、新しい月別キーに移行しました。`,
-                  });
-                }
-              }
-            }
+          const idx = await storage.get(RAW_FULLTABLE_INDEX_KEY, false);
+          if (idx && idx.value) {
+            const parsed = JSON.parse(idx.value);
+            if (Array.isArray(parsed)) knownDates = parsed;
           }
         } catch (e) {
           setRawFullTableMigrationStatus({
             type: "error",
-            msg: `旧データの確認中にエラーが発生しました：${e && e.message ? e.message : "不明なエラー"}`,
+            msg: `アナスロの索引の読み込みに失敗しました：${e && e.message ? e.message : "不明なエラー"}`,
           });
+        }
+
+        const next = {};
+        let indexNeedsWrite = false;
+
+        if (knownDates !== null) {
+          // fast path: index exists, fetch exactly the dates it lists
+          const results = await Promise.all(
+            knownDates.map(async (date) => {
+              try {
+                const r = await storage.get(rawFullTableDateKey(date), false);
+                if (!r || !r.value) return { date, ok: true, rows: null };
+                return { date, ok: true, rows: JSON.parse(r.value) };
+              } catch (e) {
+                return { date, ok: false };
+              }
+            })
+          );
+          const failedDates = [];
+          results.forEach((r) => {
+            if (!r.ok) {
+              failedDates.push(r.date);
+              return;
+            }
+            if (r.rows) next[r.date] = r.rows;
+          });
+          if (failedDates.length > 0) {
+            setRawFullTableMigrationStatus({
+              type: "error",
+              msg: `アナスロの一部データ（${failedDates.join(", ")}）の読み込みに失敗しました。ページを再読み込みしてみてください。`,
+            });
+          }
+        } else {
+          // v6.8.11 one-time bootstrap: no index yet — this either means a
+          // genuinely brand-new store, or leftover data from before the
+          // index existed (v6.8's single blob key, or v6.8.1〜v6.8.10's
+          // per-date/month keys with no index to find them by). Use 民レポ's
+          // own date list (already known, no list() needed) as the set of
+          // candidate dates to probe — this is exactly the same naming as
+          // the current per-date scheme, so any that exist are found directly.
+          let candidateDates = [];
+          try {
+            const r6 = await storage.get(OVERALL_SUMMARY_KEY, false);
+            if (r6 && r6.value) {
+              const val = JSON.parse(r6.value);
+              if (Array.isArray(val)) candidateDates = val.map((s) => s.date).filter(Boolean);
+            }
+          } catch (e) {
+            // no 民レポ dates to use as candidates — bootstrap will just rely on the legacy blob below
+          }
+
+          const probeResults = await Promise.all(
+            candidateDates.map(async (date) => {
+              try {
+                const r = await storage.get(rawFullTableDateKey(date), false);
+                if (!r || !r.value) return null;
+                return { date, rows: JSON.parse(r.value) };
+              } catch (e) {
+                return null;
+              }
+            })
+          );
+          probeResults.forEach((r) => {
+            if (r) next[r.date] = r.rows;
+          });
+
+          // also fold in the v6.8 single shared blob, if it's still there
+          try {
+            const legacy = await storage.get(LEGACY_RAW_FULLTABLE_KEY, false);
+            if (legacy && legacy.value) {
+              let legacyData;
+              try {
+                legacyData = JSON.parse(legacy.value);
+              } catch (parseErr) {
+                setRawFullTableMigrationStatus({
+                  type: "error",
+                  msg: `旧データの読み込みに失敗しました（JSON解析エラー：${parseErr.message}）。旧キー "${LEGACY_RAW_FULLTABLE_KEY}" のデータはまだ削除されていません。`,
+                });
+                legacyData = null;
+              }
+              if (legacyData && typeof legacyData === "object") {
+                let migratedCount = 0;
+                const dateWrites = [];
+                Object.entries(legacyData).forEach(([date, rows]) => {
+                  if (date in next) return;
+                  next[date] = rows;
+                  migratedCount += 1;
+                  dateWrites.push(storage.set(rawFullTableDateKey(date), JSON.stringify(rows), false).then((res) => ({ date, ok: !!res })));
+                });
+                if (migratedCount > 0) {
+                  const writeResults = await Promise.all(dateWrites);
+                  const failed = writeResults.filter((r) => !r.ok).map((r) => r.date);
+                  if (failed.length > 0) {
+                    setRawFullTableMigrationStatus({
+                      type: "error",
+                      msg: `旧データの移行中、${failed.length}件の保存に失敗しました（${failed.join(", ")}）。旧キーは安全のため削除していません。`,
+                    });
+                  } else {
+                    await storage.delete(LEGACY_RAW_FULLTABLE_KEY, false);
+                    setRawFullTableMigrationStatus({
+                      type: "ok",
+                      msg: `旧形式のデータを${migratedCount}件、日付別キーに移行しました。`,
+                    });
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            setRawFullTableMigrationStatus((prev) =>
+              prev || { type: "error", msg: `旧データの確認中にエラーが発生しました：${e && e.message ? e.message : "不明なエラー"}` }
+            );
+          }
+
+          indexNeedsWrite = true; // build & persist the index now that we've reconstructed it from scratch
+        }
+
+        rawFullTableIndexRef.current = Object.keys(next).sort();
+        if (indexNeedsWrite) {
+          try {
+            await storage.set(RAW_FULLTABLE_INDEX_KEY, JSON.stringify(rawFullTableIndexRef.current), false);
+          } catch (e) {
+            // if this fails, the next load will just re-bootstrap the same way — not fatal
+          }
         }
 
         rawFullTableRef.current = next;
@@ -1592,51 +1632,45 @@ export default function SlotDataTracker() {
       setFullTableStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
       return;
     }
-    // 1. persist raw into this date's MONTH bucket (v6.8.5). v6.8.9 fix:
-    // build the bucket from rawFullTableRef (updated synchronously) AND
-    // chain the actual write through a per-month queue, so back-to-back
-    // saves in the same month can never complete out of order and clobber
-    // each other — building from the ref alone wasn't enough by itself
-    // (confirmed by a randomized-latency stress test: an earlier, smaller
-    // snapshot could still finish writing after a later, fuller one).
-    // v6.8.10 fix: don't call setRawFullTable (which drives the visible
-    // "この日は登録済み" status) until the write is CONFIRMED successful —
-    // previously it updated optimistically before the save even finished,
-    // so a failed save still briefly showed "登録済み" right next to the
-    // error message, which was actively misleading about what actually
-    // happened. The ref itself still updates immediately (needed so a
-    // same-month save queued right behind this one builds its bucket
-    // correctly), but is reverted if this save turns out to fail.
+    // 1. persist raw into this date's OWN key (v6.8.11 — back to per-day
+    // keys since a month bucket can exceed the real ~1MB per-value limit;
+    // a single day, ~60KB, is safely under it). v6.8.10's fix (only mark
+    // "登録済み" in the UI after the write is CONFIRMED, not optimistically)
+    // still applies here.
     const previousRaw = rawFullTableRef.current;
     const nextRaw = { ...previousRaw, [fullTableDate]: rows };
-    rawFullTableRef.current = nextRaw;
-    const monthKey = rawFullTableMonthKey(fullTableDate);
-    const thisMonth = monthOf(fullTableDate);
-    const previousWrite = rawFullTableWriteQueueRef.current[monthKey] || Promise.resolve();
-    const thisWrite = previousWrite.then(() => {
-      // read from the ref again HERE (not the nextRaw captured above) —
-      // by the time this actually runs, later queued saves for other
-      // months may have added more dates to this same month too
-      const bucket = {};
-      Object.keys(rawFullTableRef.current).forEach((d) => {
-        if (monthOf(d) === thisMonth) bucket[d] = rawFullTableRef.current[d];
-      });
-      return storage.set(monthKey, JSON.stringify(bucket), false);
-    });
-    rawFullTableWriteQueueRef.current[monthKey] = thisWrite.catch(() => null);
+    const dateKey = rawFullTableDateKey(fullTableDate);
     try {
-      const res = await thisWrite;
+      const res = await storage.set(dateKey, JSON.stringify(rows), false);
       if (!res) {
-        rawFullTableRef.current = previousRaw; // don't let a failed save poison a later same-month save's bucket
         setFullTableStatus({ type: "error", msg: "生データの保存に失敗しました（storage.setがfalsyな結果を返しました）。もう一度お試しください。" });
         return;
       }
     } catch (e) {
-      rawFullTableRef.current = previousRaw;
       setFullTableStatus({ type: "error", msg: `生データの保存中にエラーが発生しました：${e && e.message ? e.message : "詳細不明"}` });
       return;
     }
-    setRawFullTable(nextRaw); // only now reflect success in the visible UI state
+    rawFullTableRef.current = nextRaw;
+    setRawFullTable(nextRaw); // only reflect success in the visible UI state once the write is confirmed
+
+    // 1b. update the shared INDEX key so future loads know this date
+    // exists. There's only one index key total, so — same lesson as
+    // v6.8.9 — chain these writes through a single queue and always build
+    // the written value from the current ref, not a value captured earlier,
+    // so back-to-back saves can't complete out of order and drop an entry.
+    const previousIndexWrite = rawFullTableIndexWriteQueueRef.current;
+    const thisIndexWrite = previousIndexWrite.then(async () => {
+      if (!rawFullTableIndexRef.current.includes(fullTableDate)) {
+        rawFullTableIndexRef.current = [...rawFullTableIndexRef.current, fullTableDate].sort();
+      }
+      return storage.set(RAW_FULLTABLE_INDEX_KEY, JSON.stringify(rawFullTableIndexRef.current), false);
+    });
+    rawFullTableIndexWriteQueueRef.current = thisIndexWrite.catch(() => null);
+    const indexRes = await thisIndexWrite.catch((e) => {
+      setFullTableStatus({ type: "error", msg: `この日のデータ自体は保存できましたが、索引の更新に失敗しました：${e && e.message ? e.message : "詳細不明"}。次回起動時に自動で見つからない可能性があります。` });
+      return null;
+    });
+    if (indexRes === null) return; // date data is safely saved either way — just flag the index concern above and stop here
 
     // 2. fan out into every page whose 正式名称 matches a 機種名 in this paste
     const autoEvent = (dateEventMap[fullTableDate] || "").trim();
