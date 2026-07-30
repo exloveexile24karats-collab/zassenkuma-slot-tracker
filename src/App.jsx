@@ -176,7 +176,13 @@ const DIGIT7_COLOR = "#f6a04d";
 // 索引がまだ無い場合（過去の旧形式のみが残っている状況）は、民レポの
 // 日付一覧を手がかりに、対応する日付キー・単一旧キーの両方から復元する
 // 一回限りのブートストラップ処理も実装。
-const APP_VERSION = "6.8.11";
+// v6.8.12: v6.8.11のブートストラップが、v6.8.5〜v6.8.10の期間に実際に
+// 保存できていた「月別キー」形式のデータ（例：slot-raw-fulltable-v1:
+// 2026-07）の存在を確認しておらず、その期間分がまるごと見えなくなって
+// いた。民レポの日付一覧から該当する月を割り出し、月別キーが残っていれ
+// ば日付ごとに分割・移行する処理を追加。実際に月別キー形式のデータを
+// 使ったテストで、正しく復元されることを確認済み。
+const APP_VERSION = "6.8.12";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1446,6 +1452,56 @@ export default function SlotDataTracker() {
           probeResults.forEach((r) => {
             if (r) next[r.date] = r.rows;
           });
+
+          // v6.8.11 bootstrap addition: v6.8.5〜v6.8.10 briefly used MONTH-
+          // bucket keys ("slot-raw-fulltable-v1:YYYY-MM", an object of
+          // {date: rows}) before that scheme was found to exceed the real
+          // ~1MB per-value limit. Any month successfully saved during that
+          // window is real data sitting under that key name — check the
+          // months actually represented in 民レポ's date list (not a blind
+          // many-month probe) and split each one found into per-day entries.
+          const candidateMonthsFromDates = Array.from(new Set(candidateDates.map((d) => monthOf(d)))).filter(Boolean);
+          const monthBucketResults = await Promise.all(
+            candidateMonthsFromDates.map(async (mo) => {
+              const k = `${RAW_FULLTABLE_KEY_PREFIX}${mo}`;
+              try {
+                const r = await storage.get(k, false);
+                if (!r || !r.value) return null;
+                return { key: k, data: JSON.parse(r.value) };
+              } catch (e) {
+                return null;
+              }
+            })
+          );
+          const monthBucketKeysToDelete = [];
+          const monthBucketDateWrites = [];
+          let monthBucketMigratedCount = 0;
+          monthBucketResults.forEach((m) => {
+            if (!m || !m.data || typeof m.data !== "object") return;
+            Object.entries(m.data).forEach(([date, rows]) => {
+              if (date in next) return; // per-day probe already found this date
+              next[date] = rows;
+              monthBucketMigratedCount += 1;
+              monthBucketDateWrites.push(storage.set(rawFullTableDateKey(date), JSON.stringify(rows), false).then((res) => ({ date, ok: !!res })));
+            });
+            monthBucketKeysToDelete.push(m.key);
+          });
+          if (monthBucketMigratedCount > 0) {
+            const writeResults = await Promise.all(monthBucketDateWrites);
+            const failed = writeResults.filter((r) => !r.ok).map((r) => r.date);
+            if (failed.length > 0) {
+              setRawFullTableMigrationStatus({
+                type: "error",
+                msg: `v6.8.5〜v6.8.10の月別データの移行中、${failed.length}件の保存に失敗しました（${failed.join(", ")}）。月別キーは安全のため削除していません。`,
+              });
+            } else {
+              await Promise.all(monthBucketKeysToDelete.map((k) => storage.delete(k, false)));
+              setRawFullTableMigrationStatus({
+                type: "ok",
+                msg: `v6.8.5〜v6.8.10で使っていた月別データを${monthBucketMigratedCount}件、日付別キーに移行しました。`,
+              });
+            }
+          }
 
           // also fold in the v6.8 single shared blob, if it's still there
           try {
