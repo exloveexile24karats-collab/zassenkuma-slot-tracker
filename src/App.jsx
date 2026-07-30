@@ -71,7 +71,14 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.5";
+// v6.7 (雑餉隈): walk-forward backtest on real zassenkuma data (2026-05-01〜
+// 07-29) showed the percentile-based 相対ローテーション signal had ~0pt edge
+// here (unlike プラザ本店II), likely because same-day percentile ranking
+// can't detect a store-wide event boost by construction. Replaced its weight
+// with three newly backtested signals: 自己平均比ローテーション (self-baseline
+// trend, +5.4pt), イベント名×台番号末尾一致 (+7.7pt page-level), and 凹み上げ
+// (+5.7〜5.9pt). See conversation history for full backtest numbers.
+const APP_VERSION = "6.7";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -329,7 +336,18 @@ function scoreToGrade(score) {
 // backtesting (real hall data, walk-forward) showed these specific signals
 // have a genuine, repeatable edge; everything else is kept as a smaller
 // tie-breaker rather than being dropped, since it still carries some signal
-const STRONG_SIGNAL_LABELS = new Set(["強いイベント間トレンド", "相対ローテーション（設定良さそう）", "イベント登録連動", "イベント直前10日トレンド"]);
+const STRONG_SIGNAL_LABELS = new Set([
+  "強いイベント間トレンド",
+  "イベント登録連動",
+  "イベント直前10日トレンド",
+  // v6.7: 相対ローテーション（設定良さそう）was here previously, but backtested
+  // to ~0pt on zassenkuma data — replaced by 自己平均比ローテーション（好調）,
+  // which backtested to +5.4pt. 台番号末尾一致 and 凹み上げ are also newly
+  // proven signals (+7.7pt / +5.7〜5.9pt) — see the v6.7 signal functions above.
+  "自己平均比ローテーション（好調）",
+  "イベント名×台番号末尾一致",
+  "凹み上げ",
+]);
 function isStrongSignalLabel(label) {
   const baseLabel = label.replace(/[（(].*[）)]/g, "").trim();
   return STRONG_SIGNAL_LABELS.has(baseLabel) || baseLabel.startsWith("日付末尾");
@@ -393,14 +411,25 @@ const SIGNAL_WEIGHTS = {
   semiFollow: 0.5, // 準イベント翌日 — weaker tier than 強いイベント
   plannedEvent: 1.5, // イベント登録連動 — backtested clearly above baseline
   recommend: 1,
-  settingGood: 1.5, // 相対ローテーション（設定良さそう）— backtested clearly above baseline
-  settingLow: 1,
+  // v6.7: dialed down hard — walk-forward backtest on zassenkuma data showed
+  // ~0pt edge for the same-day-percentile version of this signal (see
+  // selfBaselineTrend below for the replacement that actually shows an edge).
+  // Kept non-zero rather than removed in case a future store's data
+  // vindicates the percentile approach.
+  settingGood: 0.2, // 相対ローテーション（設定良さそう、同日内順位）— backtested ~no edge on zassenkuma
+  settingLow: 0.3,
   volumeMismatch: 0.3, // 大量回転・低調 — backtested ~no edge
   digitDay: 1, // any 日付末尾, generalized (not just 2/7) — backtested strong for "2", strong AGAINST for "0"
   interEventTrend: 0.7, // new: modest but consistent edge in backtest
   strongInterEventTrend: 0.9, // 強いイベント同士の間のトレンド — strongest tier
   semiInterEventTrend: 0.4, // 準イベント同士の間のトレンド — weakest tier
   preEventTrend: 1.5, // イベント直前10日トレンド — backtested strong for 2のつく日(13pt)/7のつく日(7pt)
+  // v6.7 additions — see evaluateSelfBaselineTrend / evaluateEventDigitMatch /
+  // evaluateDipRebound above for what each measures and their backtest results
+  selfBaselineHot: 1.3, // 自己平均比ローテーション（好調）— backtested +5.4pt on zassenkuma, clearly above the old percentile version
+  selfBaselineCold: 0.5, // 自己平均比ローテーション（不調）— backtested only +1.7pt, weaker edge, lower weight
+  eventDigitMatch: 1.3, // イベント名×台番号末尾一致 — backtested +7.7pt page-level, +6.0/+3.4pt store-wide, one of the strongest signals found
+  dipRebound: 1.2, // 凹み上げ — backtested +5.7〜5.9pt consistently across page-level and store-wide data
 };
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -741,6 +770,106 @@ function evaluateSuspectedSettingFollow(seriesFull, flagByDate) {
     return { sampleSize: arr.length, winRate: wins / arr.length, avg: arr.reduce((a, b) => a + b, 0) / arr.length };
   }
   return { good: summarize(goodVals), low: summarize(lowVals) };
+}
+
+// v6.7 NEW SIGNAL: self-baseline rotation — replaces the old same-day
+// percentile approach (which structurally can't detect "the whole store got
+// better today" since it always buckets ~25% of machines as "good" no matter
+// what). This instead compares THIS machine's own trailing 7-day average
+// 差枚 against its own longer trailing baseline (up to 60 days before that),
+// so a store-wide event-day boost actually shows up as more machines
+// crossing the threshold — backtested edge on real zassenkuma data: ~+5pt
+// for the "hot" case (vs ~0pt for the old percentile method)
+function evaluateSelfBaselineTrend(series, recentWindow = 7, baselineWindow = 60, threshold = 200) {
+  if (series.length < recentWindow + 10) return null;
+  const i = series.length - 1; // "today" — the flag applies looking back from here
+  const recent = series.slice(Math.max(0, i - recentWindow + 1), i + 1);
+  const baseline = series.slice(Math.max(0, i - recentWindow + 1 - baselineWindow), Math.max(0, i - recentWindow + 1));
+  if (recent.length < Math.min(5, recentWindow) || baseline.length < 10) return null;
+  const recentAvg = recent.reduce((a, s) => a + s.sada, 0) / recent.length;
+  const baselineAvg = baseline.reduce((a, s) => a + s.sada, 0) / baseline.length;
+  const diff = recentAvg - baselineAvg;
+  const flag = diff >= threshold ? "hot" : diff <= -threshold ? "cold" : null;
+  return { flag, recentAvg, baselineAvg, diff };
+}
+
+// historical backtest of the above: for every past day where this same
+// hot/cold condition held, how did the FOLLOWING day actually go? mirrors
+// evaluateSuspectedSettingFollow's shape but keyed on the self-baseline
+// diff instead of the same-day percentile rank
+function evaluateSelfBaselineFollow(series, recentWindow = 7, baselineWindow = 60, threshold = 200) {
+  const hotVals = [];
+  const coldVals = [];
+  for (let i = recentWindow + 10; i < series.length - 1; i++) {
+    const sub = series.slice(0, i + 1);
+    const state = evaluateSelfBaselineTrend(sub, recentWindow, baselineWindow, threshold);
+    if (!state || !state.flag) continue;
+    const next = series[i + 1].sada;
+    (state.flag === "hot" ? hotVals : coldVals).push(next);
+  }
+  function summarize(arr) {
+    if (arr.length < 5) return null;
+    const wins = arr.filter((v) => v > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avg: arr.reduce((a, b) => a + b, 0) / arr.length };
+  }
+  return { hot: summarize(hotVals), cold: summarize(coldVals) };
+}
+
+// v6.7 NEW SIGNAL: event-name digit match — e.g. "9のつく日" boosting
+// machines whose number ends in 9, "4のつく日" boosting those ending in 4.
+// backtested clearly above the plain 日付末尾 signal on real zassenkuma data
+// (+7.7pt page-level, +6.0/+3.4pt store-wide) — generalizes to any "Nのつく
+// 日" style event name rather than hard-coding specific digits
+const EVENT_DIGIT_PATTERN = /([0-9])のつく日/;
+function extractEventDigit(eventName) {
+  const m = eventName && eventName.match(EVENT_DIGIT_PATTERN);
+  return m ? parseInt(m[1], 10) : null;
+}
+function evaluateEventDigitMatch(series, historyByDate, machineNo, tomorrowEventNames) {
+  const relevantDigits = new Set(
+    (tomorrowEventNames || []).map(extractEventDigit).filter((d) => d !== null)
+  );
+  if (relevantDigits.size === 0) return null;
+  if (!relevantDigits.has(machineNo % 10)) return null; // this machine's number doesn't match any of tomorrow's digit-events
+
+  const matchVals = [];
+  const otherVals = [];
+  series.forEach((s) => {
+    const entry = historyByDate[s.date];
+    const evs = entry && entry.event ? splitEventNames(entry.event) : [];
+    const dayDigits = new Set(evs.map(extractEventDigit).filter((d) => d !== null));
+    const isMatch = dayDigits.size > 0 && [...dayDigits].some((d) => machineNo % 10 === d);
+    (isMatch ? matchVals : otherVals).push(s.sada);
+  });
+  if (matchVals.length < 5) return null;
+  function summarize(arr) {
+    if (arr.length < 5) return null;
+    const wins = arr.filter((v) => v > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avgNext: arr.reduce((a, v) => a + v, 0) / arr.length };
+  }
+  const matched = summarize(matchVals);
+  const other = summarize(otherVals);
+  return { ...matched, normalRate: other ? other.winRate : null, normalAvg: other ? other.avgNext : null };
+}
+
+// v6.7 NEW SIGNAL: 凹み上げ (dip-then-rebound) — yesterday was a losing day
+// for this machine AND tomorrow is a registered strong-event day. backtested
+// consistently on real data (page-level +5.7〜5.8pt, store-wide +5.9pt) —
+// previously flagged in the handoff notes as "worth implementing" but never
+// wired in
+function evaluateDipRebound(series, strongDateSet) {
+  const pairs = [];
+  for (let i = 0; i < series.length - 1; i++) {
+    if (series[i].sada >= 0) continue; // only care about days that were a loss
+    const isStrongNext = strongDateSet.has(series[i + 1].date);
+    pairs.push({ isStrongNext, nextSada: series[i + 1].sada });
+  }
+  function summarize(arr) {
+    if (arr.length < 5) return null;
+    const wins = arr.filter((p) => p.nextSada > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avgNext: arr.reduce((a, p) => a + p.nextSada, 0) / arr.length };
+  }
+  return { strong: summarize(pairs.filter((p) => p.isStrongNext)), normal: summarize(pairs.filter((p) => !p.isStrongNext)) };
 }
 
 // On a categorical date axis, a single day has zero width, so widen it by
@@ -1898,6 +2027,33 @@ export default function SlotDataTracker() {
 
       const isTomorrowEvent = !!plannedEventName;
 
+      // v6.7: self-baseline rotation — is THIS machine, right now, running
+      // hot/cold relative to its OWN typical level (not relative to peers)?
+      const selfBaselineState = series.length >= 17 ? evaluateSelfBaselineTrend(series) : null;
+      const selfBaselineFollow = series.length >= 30 ? evaluateSelfBaselineFollow(series) : null;
+      let selfBaselineHotMatch = null;
+      let selfBaselineColdMatch = null;
+      if (selfBaselineState && selfBaselineState.flag === "hot" && selfBaselineFollow && selfBaselineFollow.hot) {
+        selfBaselineHotMatch = selfBaselineFollow.hot;
+      }
+      if (selfBaselineState && selfBaselineState.flag === "cold" && selfBaselineFollow && selfBaselineFollow.cold) {
+        selfBaselineColdMatch = selfBaselineFollow.cold;
+      }
+
+      // v6.7: does tomorrow's event name match this machine's own 台番号末尾
+      // (e.g. tomorrow is "9のつく日" and this machine's number ends in 9)?
+      const eventDigitMatch = evaluateEventDigitMatch(series, pageHistoryByDate, no, plannedEventNameList);
+
+      // v6.7: 凹み上げ — did TODAY lose, and is TOMORROW a registered strong-event day?
+      let dipReboundMatch = null;
+      if (lastDate && series.length > 0) {
+        const todaySada = series[series.length - 1].sada;
+        if (todaySada < 0 && pageStrongDateSet.has(tomorrowDate)) {
+          const dipEval = evaluateDipRebound(series, pageStrongDateSet);
+          if (dipEval && dipEval.strong) dipReboundMatch = dipEval.strong;
+        }
+      }
+
       const hasAnySignal =
         matchedWindows.length > 0 ||
         streakMatch ||
@@ -1913,7 +2069,11 @@ export default function SlotDataTracker() {
         interEventTrendMatch ||
         strongInterEventTrendMatch ||
         semiInterEventTrendMatch ||
-        preEventTrendMatch;
+        preEventTrendMatch ||
+        selfBaselineHotMatch ||
+        selfBaselineColdMatch ||
+        eventDigitMatch ||
+        dipReboundMatch;
       if (!hasAnySignal) return;
 
       // ---- additive/subtractive scoring: every signal (favorable OR
@@ -2005,6 +2165,27 @@ export default function SlotDataTracker() {
         const winPts = computePoints(volumeMismatch.nextDayStats.winRate, baseRate, volumeMismatch.nextDayStats.sampleSize);
         const evPts = computeEvPoints(volumeMismatch.nextDayStats.avg, machineAvgSada, machineTypicalMagnitude, volumeMismatch.nextDayStats.sampleSize);
         scoreItems.push({ label: "大量回転・低調", points: (winPts + evPts) * SIGNAL_WEIGHTS.volumeMismatch });
+      }
+      if (selfBaselineHotMatch) {
+        const winPts = computePoints(selfBaselineHotMatch.winRate, baseRate, selfBaselineHotMatch.sampleSize);
+        const evPts = computeEvPoints(selfBaselineHotMatch.avg, machineAvgSada, machineTypicalMagnitude, selfBaselineHotMatch.sampleSize);
+        scoreItems.push({ label: "自己平均比ローテーション（好調）", points: (winPts + evPts) * SIGNAL_WEIGHTS.selfBaselineHot });
+      }
+      if (selfBaselineColdMatch) {
+        const winPts = computePoints(selfBaselineColdMatch.winRate, baseRate, selfBaselineColdMatch.sampleSize);
+        const evPts = computeEvPoints(selfBaselineColdMatch.avg, machineAvgSada, machineTypicalMagnitude, selfBaselineColdMatch.sampleSize);
+        scoreItems.push({ label: "自己平均比ローテーション（不調）", points: (winPts + evPts) * SIGNAL_WEIGHTS.selfBaselineCold });
+      }
+      if (eventDigitMatch) {
+        const normalRate = eventDigitMatch.normalRate !== null ? eventDigitMatch.normalRate : baseRate;
+        const winPts = computePoints(eventDigitMatch.winRate, normalRate, eventDigitMatch.sampleSize);
+        const evPts = computeEvPoints(eventDigitMatch.avgNext, eventDigitMatch.normalAvg ?? machineAvgSada, machineTypicalMagnitude, eventDigitMatch.sampleSize);
+        scoreItems.push({ label: "イベント名×台番号末尾一致", points: (winPts + evPts) * SIGNAL_WEIGHTS.eventDigitMatch });
+      }
+      if (dipReboundMatch) {
+        const winPts = computePoints(dipReboundMatch.winRate, baseRate, dipReboundMatch.sampleSize);
+        const evPts = computeEvPoints(dipReboundMatch.avgNext, machineAvgSada, machineTypicalMagnitude, dipReboundMatch.sampleSize);
+        scoreItems.push({ label: "凹み上げ", points: (winPts + evPts) * SIGNAL_WEIGHTS.dipRebound });
       }
 
       let strongSignalCount = 0;
