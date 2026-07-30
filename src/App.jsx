@@ -160,7 +160,14 @@ const DIGIT7_COLOR = "#f6a04d";
 // 機種名を候補にするdatalistを再設置。あわせて、読み込みタイミングの問題
 // などでバックフィルが最初うまく走らなかった場合のために、正式名称の隣に
 // 手動で「アナスロから再取得」できるボタンを追加。
-const APP_VERSION = "6.8.8";
+// v6.8.9: 月バケット方式（v6.8.5）に、日付を続けざまに素早く保存すると
+// 途中の日付が消える競合状態（lost update）があった。ref経由で常に最新の
+// 状態から書き込む内容を組み立てるようにしただけでは不十分で（書き込み
+// 自体が完了する順番が入れ替わると、後から始めた保存の方が先に完了した
+// 保存を上書きしてしまう）、同じ月への書き込みを必ず順番通りに実行する
+// キューを追加して解消。ランダムな遅延を模したテストで、キュー無しだと
+// 実際にデータが消えること・キューありだと消えないことを確認済み。
+const APP_VERSION = "6.8.9";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1210,6 +1217,21 @@ export default function SlotDataTracker() {
   // a not-yet-registered model's data isn't lost and can be backfilled
   // once its page is created. ----
   const [rawFullTable, setRawFullTable] = useState({}); // { [date]: [{modelName,no,gsuNormal,sada,bb,rb,gousei,bbRateStr,rbRateStr}] }
+  // v6.8.9: kept in lockstep with rawFullTable so handleSaveFullTable can
+  // read the up-to-the-millisecond merged state even when the person saves
+  // several dates back-to-back faster than React re-renders — reading from
+  // the ref instead of the closed-over state (or re-fetching from storage,
+  // which is racy against a save that hasn't committed yet) is what
+  // actually fixes the "middle dates disappear" lost-update bug.
+  const rawFullTableRef = useRef({});
+  // v6.8.9: per-month-key write queue — even with rawFullTableRef always
+  // holding the fullest merged state, concurrent storage.set() calls for
+  // the SAME month could still complete OUT OF ORDER (whichever finishes
+  // last wins, and an earlier/smaller snapshot finishing last would still
+  // clobber a later/fuller one). Chaining each month's writes strictly
+  // after the previous one for that month closes this gap — verified with
+  // a randomized-latency stress test before shipping.
+  const rawFullTableWriteQueueRef = useRef({});
   const [rawFullTableLoaded, setRawFullTableLoaded] = useState(false);
   const [rawFullTableMigrationStatus, setRawFullTableMigrationStatus] = useState(null);
   const [fullTableDate, setFullTableDate] = useState(todayStr());
@@ -1437,6 +1459,7 @@ export default function SlotDataTracker() {
           });
         }
 
+        rawFullTableRef.current = next;
         setRawFullTable(next);
       } catch (e) {
         setRawFullTableMigrationStatus({
@@ -1562,24 +1585,32 @@ export default function SlotDataTracker() {
       setFullTableStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
       return;
     }
-    // 1. persist raw into this date's MONTH bucket (v6.8.5) — read the
-    // current bucket first, merge in just this date, write the bucket back.
-    // Never write the whole accumulated rawFullTable as one blob (v6.8's
-    // mistake) and never use one key per day (v6.8.1-6.8.4's mistake, which
-    // required ~90 GETs on every load and likely triggered rate limiting).
-    const nextRaw = { ...rawFullTable, [fullTableDate]: rows };
+    // 1. persist raw into this date's MONTH bucket (v6.8.5). v6.8.9 fix:
+    // build the bucket from rawFullTableRef (updated synchronously) AND
+    // chain the actual write through a per-month queue, so back-to-back
+    // saves in the same month can never complete out of order and clobber
+    // each other — building from the ref alone wasn't enough by itself
+    // (confirmed by a randomized-latency stress test: an earlier, smaller
+    // snapshot could still finish writing after a later, fuller one).
+    const nextRaw = { ...rawFullTableRef.current, [fullTableDate]: rows };
+    rawFullTableRef.current = nextRaw;
     setRawFullTable(nextRaw);
     const monthKey = rawFullTableMonthKey(fullTableDate);
+    const thisMonth = monthOf(fullTableDate);
+    const previousWrite = rawFullTableWriteQueueRef.current[monthKey] || Promise.resolve();
+    const thisWrite = previousWrite.then(() => {
+      // read from the ref again HERE (not the nextRaw captured above) —
+      // by the time this actually runs, later queued saves for other
+      // months may have added more dates to this same month too
+      const bucket = {};
+      Object.keys(rawFullTableRef.current).forEach((d) => {
+        if (monthOf(d) === thisMonth) bucket[d] = rawFullTableRef.current[d];
+      });
+      return storage.set(monthKey, JSON.stringify(bucket), false);
+    });
+    rawFullTableWriteQueueRef.current[monthKey] = thisWrite.catch(() => null);
     try {
-      let monthBucket = {};
-      try {
-        const existing = await storage.get(monthKey, false);
-        if (existing && existing.value) monthBucket = JSON.parse(existing.value);
-      } catch (e) {
-        // no bucket yet for this month — start fresh
-      }
-      monthBucket[fullTableDate] = rows;
-      const res = await storage.set(monthKey, JSON.stringify(monthBucket), false);
+      const res = await thisWrite;
       if (!res) {
         setFullTableStatus({ type: "error", msg: "生データの保存に失敗しました。もう一度お試しください。" });
         return;
