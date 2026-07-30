@@ -167,7 +167,14 @@ const DIGIT7_COLOR = "#f6a04d";
 // 保存を上書きしてしまう）、同じ月への書き込みを必ず順番通りに実行する
 // キューを追加して解消。ランダムな遅延を模したテストで、キュー無しだと
 // 実際にデータが消えること・キューありだと消えないことを確認済み。
-const APP_VERSION = "6.8.9";
+// v6.8.10: アナスロの保存が実際には失敗しているのに、画面上は「この日は
+// 登録済み」と楽観的に（保存成功を待たずに）表示してしまい、赤いエラー
+// メッセージと緑の「登録済み」が同時に出るという矛盾した表示になってい
+// た。保存の成否が確定してから初めて「登録済み」表示を更新するように変
+// 更。失敗時は次の同月保存を汚染しないようref側も元に戻す。あわせて
+// エラーメッセージに実際の例外内容を含めるようにし、原因の切り分けをし
+// やすくした。
+const APP_VERSION = "6.8.10";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1592,9 +1599,17 @@ export default function SlotDataTracker() {
     // each other — building from the ref alone wasn't enough by itself
     // (confirmed by a randomized-latency stress test: an earlier, smaller
     // snapshot could still finish writing after a later, fuller one).
-    const nextRaw = { ...rawFullTableRef.current, [fullTableDate]: rows };
+    // v6.8.10 fix: don't call setRawFullTable (which drives the visible
+    // "この日は登録済み" status) until the write is CONFIRMED successful —
+    // previously it updated optimistically before the save even finished,
+    // so a failed save still briefly showed "登録済み" right next to the
+    // error message, which was actively misleading about what actually
+    // happened. The ref itself still updates immediately (needed so a
+    // same-month save queued right behind this one builds its bucket
+    // correctly), but is reverted if this save turns out to fail.
+    const previousRaw = rawFullTableRef.current;
+    const nextRaw = { ...previousRaw, [fullTableDate]: rows };
     rawFullTableRef.current = nextRaw;
-    setRawFullTable(nextRaw);
     const monthKey = rawFullTableMonthKey(fullTableDate);
     const thisMonth = monthOf(fullTableDate);
     const previousWrite = rawFullTableWriteQueueRef.current[monthKey] || Promise.resolve();
@@ -1612,13 +1627,16 @@ export default function SlotDataTracker() {
     try {
       const res = await thisWrite;
       if (!res) {
-        setFullTableStatus({ type: "error", msg: "生データの保存に失敗しました。もう一度お試しください。" });
+        rawFullTableRef.current = previousRaw; // don't let a failed save poison a later same-month save's bucket
+        setFullTableStatus({ type: "error", msg: "生データの保存に失敗しました（storage.setがfalsyな結果を返しました）。もう一度お試しください。" });
         return;
       }
     } catch (e) {
-      setFullTableStatus({ type: "error", msg: "生データの保存中にエラーが発生しました。" });
+      rawFullTableRef.current = previousRaw;
+      setFullTableStatus({ type: "error", msg: `生データの保存中にエラーが発生しました：${e && e.message ? e.message : "詳細不明"}` });
       return;
     }
+    setRawFullTable(nextRaw); // only now reflect success in the visible UI state
 
     // 2. fan out into every page whose 正式名称 matches a 機種名 in this paste
     const autoEvent = (dateEventMap[fullTableDate] || "").trim();
