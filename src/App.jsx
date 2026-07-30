@@ -63,7 +63,6 @@ const RAW_FULLTABLE_KEY = "slot-raw-fulltable-v1";
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
 const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
-const FULLTABLE_MODEL_NAME_DATALIST_ID = "slot-fulltable-model-name-options";
 
 const PALETTE = [
   "#e8b34c", "#4fd1c5", "#e5697a", "#7aa2f7", "#9ece6a",
@@ -209,6 +208,26 @@ function parseOverallSummary(text) {
   const modelText = idx === -1 ? text : text.slice(0, idx);
   const digitText = idx === -1 ? "" : text.slice(idx);
   return { modelRows: parseSummaryTable(modelText), digitRows: parseSummaryTable(digitText) };
+}
+
+// v6.8: inverse of parseSummaryTable — reconstructs pasteable tab-separated
+// text from already-stored rows, so clicking a past 民レポ date can reload
+// it into the edit textarea instead of only offering delete
+function serializeSummaryRows(rows) {
+  return (rows || [])
+    .map((r) => {
+      const avgSada = r.avgSada === null || r.avgSada === undefined ? "" : r.avgSada;
+      const avgGsu = r.avgGsu === null || r.avgGsu === undefined ? "-" : r.avgGsu;
+      const winFrac = r.wins === null || r.total === null || r.wins === undefined || r.total === undefined ? "" : `${r.wins}/${r.total}`;
+      const shutsu = r.shutsu === null || r.shutsu === undefined ? "" : `${r.shutsu}%`;
+      return [r.name, avgSada, avgGsu, winFrac, shutsu].join("\t");
+    })
+    .join("\n");
+}
+function serializeOverallSummary(s) {
+  const modelText = serializeSummaryRows(s.modelRows);
+  const digitText = serializeSummaryRows(s.digitRows);
+  return digitText ? `${modelText}\n末尾別データ\n${digitText}` : modelText;
 }
 
 // v6.8: parses the whole-store, all-machines, per-number granular table
@@ -1582,6 +1601,15 @@ export default function SlotDataTracker() {
     setConfirmDeleteOverall(null);
   }
 
+  // v6.8: clicking an already-registered date reloads it into the edit
+  // form (date + textarea) instead of only offering delete — saving over
+  // it just overwrites that date's entry as before
+  function handleEditOverall(s) {
+    setOverallDate(s.date);
+    setOverallPasteText(serializeOverallSummary(s));
+    setOverallStatus({ type: "ok", msg: `${s.date} のデータを編集用に読み込みました。修正して保存すると上書きされます。` });
+  }
+
   function handleDeleteAllOverall() {
     pushUndoEntry("全体データを全部削除", OVERALL_SUMMARY_KEY, overallSummaries);
     persistOverallSummaries([]);
@@ -2528,19 +2556,11 @@ export default function SlotDataTracker() {
   );
 
   // every model name that has ever appeared in a 機種別サマリー snapshot —
-  // used as autocomplete options for the model-name-based おすすめ機種期間
-  // registration (that feature is explicitly tied to 民レポ/全体データ names)
+  // used as autocomplete options for 正式名称 and for the model-name-based
+  // おすすめ機種期間 registration
   const allKnownModelNames = useMemo(
     () => Array.from(new Set(overallSummaries.flatMap((s) => s.modelRows.map((r) => r.name)))).sort(),
     [overallSummaries]
-  );
-
-  // v6.8: 正式名称 is what アナスロ's fan-out matches against, and 民レポ/
-  // アナスロ can spell the same model slightly differently — so its
-  // autocomplete pulls from アナスロ (rawFullTable), not 民レポ
-  const allKnownModelNamesFromFullTable = useMemo(
-    () => Array.from(new Set(Object.values(rawFullTable).flatMap((rows) => rows.map((r) => r.modelName)))).sort(),
-    [rawFullTable]
   );
 
   // actual realized performance for each registered おすすめ機種期間 (machine
@@ -4561,11 +4581,18 @@ export default function SlotDataTracker() {
                   {overallSummariesLoaded && overallSortedSummaries.length === 0 && (
                     <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
                   )}
-                  {[...overallSortedSummaries].reverse().map((s) => (
-                    <div key={s.date} style={{
-                      display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
-                      background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
-                    }}>
+                  {[...overallSortedSummaries].reverse().map((s) => {
+                    const hasFullTable = !!rawFullTable[s.date];
+                    return (
+                    <div
+                      key={s.date}
+                      onClick={() => handleEditOverall(s)}
+                      title="クリックでこの日のデータを編集"
+                      style={{
+                        display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                        background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
+                        cursor: "pointer",
+                      }}>
                       <div>
                         <span className="mono">{s.date}</span>
                         {s.event && (() => {
@@ -4596,19 +4623,23 @@ export default function SlotDataTracker() {
                           );
                         })()}
                         <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>
+                        <span style={{ marginLeft: "6px", color: "#9ece6a" }}>民レポ〇</span>
+                        <span style={{ marginLeft: "6px", color: hasFullTable ? "#9ece6a" : "#e5697a" }}>
+                          アナスロ{hasFullTable ? "〇" : "未登録"}
+                        </span>
                       </div>
                       {confirmDeleteOverall === s.date ? (
-                        <div style={{ display: "flex", gap: "6px" }}>
+                        <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
                           <button onClick={() => handleDeleteOverall(s.date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
                           <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
                         </div>
                       ) : (
-                        <button onClick={() => setConfirmDeleteOverall(s.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                        <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteOverall(s.date); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
                           <Trash2 size={13} />
                         </button>
                       )}
                     </div>
-                  ))}
+                  );})}
                 </div>
               </div>
             </div>
@@ -4672,10 +4703,10 @@ export default function SlotDataTracker() {
         />
       </div>
       <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
-        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（アナスロと連携・任意）：</span>
+        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（全体データと連携・任意）：</span>
         <input
           type="text"
-          list={FULLTABLE_MODEL_NAME_DATALIST_ID}
+          list={MODEL_NAME_DATALIST_ID}
           value={currentPage ? currentPage.officialName || "" : ""}
           onChange={(e) => handleSetOfficialName(activePageId, e.target.value)}
           placeholder="例：Lパチスロからくりサーカス2"
@@ -5375,12 +5406,6 @@ export default function SlotDataTracker() {
           tabs (共通設定, 機種ページ) reference this same datalist by id */}
       <datalist id={MODEL_NAME_DATALIST_ID}>
         {allKnownModelNames.map((n) => (
-          <option value={n} key={n} />
-        ))}
-      </datalist>
-      {/* v6.8: 正式名称 は民レポではなくアナスロの機種名と紐付けるため別のdatalist */}
-      <datalist id={FULLTABLE_MODEL_NAME_DATALIST_ID}>
-        {allKnownModelNamesFromFullTable.map((n) => (
           <option value={n} key={n} />
         ))}
       </datalist>
