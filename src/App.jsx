@@ -59,7 +59,14 @@ const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,s
 // model IS registered, and is also the input for the 設定判別 (setting
 // inference) feature for currently-tracked models. Keyed by date:
 // { [date]: [{modelName, no, gsuNormal, sada, bb, rb, gousei, bbRateStr, rbRateStr}] }
-const RAW_FULLTABLE_KEY = "slot-raw-fulltable-v1";
+// v6.8.1: split into one key PER DATE (slot-raw-fulltable-v1:2026-07-06) —
+// a single shared key accumulating every day's full-store data eventually
+// exceeds the per-key storage size limit, which is exactly what caused
+// saves to start failing once enough days had been pasted in.
+const RAW_FULLTABLE_KEY_PREFIX = "slot-raw-fulltable-v1:";
+function rawFullTableKey(date) {
+  return `${RAW_FULLTABLE_KEY_PREFIX}${date}`;
+}
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
 const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
@@ -1260,11 +1267,26 @@ export default function SlotDataTracker() {
         setOverallSummariesLoaded(true);
       }
       try {
-        const r6b = await storage.get(RAW_FULLTABLE_KEY, false);
-        if (r6b && r6b.value) {
-          const val = JSON.parse(r6b.value);
-          if (val && typeof val === "object") setRawFullTable(val);
-        }
+        const listRes = await storage.list(RAW_FULLTABLE_KEY_PREFIX, false);
+        const keys = (listRes && listRes.keys) || [];
+        const entries = await Promise.all(
+          keys.map(async (k) => {
+            try {
+              const r = await storage.get(k, false);
+              if (!r || !r.value) return null;
+              const date = k.slice(RAW_FULLTABLE_KEY_PREFIX.length);
+              const rows = JSON.parse(r.value);
+              return [date, rows];
+            } catch (e) {
+              return null; // skip a single corrupt/unreadable date rather than failing the whole load
+            }
+          })
+        );
+        const next = {};
+        entries.forEach((e) => {
+          if (e) next[e[0]] = e[1];
+        });
+        setRawFullTable(next);
       } catch (e) {
         // none yet
       } finally {
@@ -1386,11 +1408,16 @@ export default function SlotDataTracker() {
       setFullTableStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
       return;
     }
-    // 1. persist raw, keyed by date (overwrites this date's prior paste, if any)
+    // 1. persist raw, one key per date (overwrites this date's prior paste, if any) —
+    // never write the whole accumulated rawFullTable as one blob, see v6.8.1 note above
     const nextRaw = { ...rawFullTable, [fullTableDate]: rows };
     setRawFullTable(nextRaw);
     try {
-      await storage.set(RAW_FULLTABLE_KEY, JSON.stringify(nextRaw), false);
+      const res = await storage.set(rawFullTableKey(fullTableDate), JSON.stringify(rows), false);
+      if (!res) {
+        setFullTableStatus({ type: "error", msg: "生データの保存に失敗しました。もう一度お試しください。" });
+        return;
+      }
     } catch (e) {
       setFullTableStatus({ type: "error", msg: "生データの保存中にエラーが発生しました。" });
       return;
