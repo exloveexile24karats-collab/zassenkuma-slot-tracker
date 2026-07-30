@@ -91,6 +91,7 @@ function recentMonthStrings(count) {
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
 const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
+const FULLTABLE_MODEL_NAME_DATALIST_ID = "slot-fulltable-model-name-options";
 
 const PALETTE = [
   "#e8b34c", "#4fd1c5", "#e5697a", "#7aa2f7", "#9ece6a",
@@ -153,7 +154,13 @@ const DIGIT7_COLOR = "#f6a04d";
 // 有無で一致しない機種があった（モンキーターンV・マイジャグラーVのよう
 // なシンプルな名前は偶然一致していただけ）。NFKC正規化＋記号統一＋空白
 // 除去で、この手の表記ゆれを幅広く吸収するように変更。
-const APP_VERSION = "6.8.7";
+// v6.8.8: 正式名称のプルダウンが、実はアナスロではなく民レポ（全体データ）
+// の機種名を表示し続けていたことが判明（v6.8で一度アナスロ側に直したはず
+// が、その後の編集のどこかで元に戻ってしまっていた）。改めてアナスロの
+// 機種名を候補にするdatalistを再設置。あわせて、読み込みタイミングの問題
+// などでバックフィルが最初うまく走らなかった場合のために、正式名称の隣に
+// 手動で「アナスロから再取得」できるボタンを追加。
+const APP_VERSION = "6.8.8";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2785,11 +2792,20 @@ export default function SlotDataTracker() {
   );
 
   // every model name that has ever appeared in a 機種別サマリー snapshot —
-  // used as autocomplete options for 正式名称 and for the model-name-based
-  // おすすめ機種期間 registration
+  // used as autocomplete options for the model-name-based おすすめ機種期間
+  // registration (that feature is explicitly tied to 民レポ/全体データ names)
   const allKnownModelNames = useMemo(
     () => Array.from(new Set(overallSummaries.flatMap((s) => s.modelRows.map((r) => r.name)))).sort(),
     [overallSummaries]
+  );
+
+  // v6.8.8: re-adding this — it was lost somewhere during a later edit
+  // despite being added back in v6.8. 正式名称 must match against アナスロ's
+  // 機種名 spelling (that's what handleSaveFullTable/backfill actually
+  // compare against), NOT 民レポ's spelling, which can differ.
+  const allKnownModelNamesFromFullTable = useMemo(
+    () => Array.from(new Set(Object.values(rawFullTable).flatMap((rows) => rows.map((r) => r.modelName)))).sort(),
+    [rawFullTable]
   );
 
   // actual realized performance for each registered おすすめ機種期間 (machine
@@ -4953,10 +4969,10 @@ export default function SlotDataTracker() {
         />
       </div>
       <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
-        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（全体データと連携・任意）：</span>
+        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（アナスロと連携・任意）：</span>
         <input
           type="text"
-          list={MODEL_NAME_DATALIST_ID}
+          list={FULLTABLE_MODEL_NAME_DATALIST_ID}
           value={currentPage ? currentPage.officialName || "" : ""}
           onChange={(e) => handleSetOfficialName(activePageId, e.target.value)}
           placeholder="例：Lパチスロからくりサーカス2"
@@ -4970,6 +4986,19 @@ export default function SlotDataTracker() {
             minWidth: "280px",
           }}
         />
+        <button
+          onClick={() => currentPage && currentPage.officialName && backfillPageFromRawTable(activePageId, currentPage.officialName)}
+          disabled={!currentPage || !currentPage.officialName}
+          title="アナスロに貯まっている過去分を、今の正式名称でもう一度取り込み直す（読み込みタイミングの問題などで最初に取り込めなかった場合用）"
+          style={{
+            fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px",
+            color: currentPage && currentPage.officialName ? "#8b93a3" : "#3a3f4a",
+            padding: "5px 8px", cursor: currentPage && currentPage.officialName ? "pointer" : "not-allowed",
+            whiteSpace: "nowrap",
+          }}
+        >
+          🔄 アナスロから再取得
+        </button>
       </div>
 
       <div
@@ -5656,6 +5685,12 @@ export default function SlotDataTracker() {
           tabs (共通設定, 機種ページ) reference this same datalist by id */}
       <datalist id={MODEL_NAME_DATALIST_ID}>
         {allKnownModelNames.map((n) => (
+          <option value={n} key={n} />
+        ))}
+      </datalist>
+      {/* v6.8.8: 正式名称 はアナスロの機種名と紐付けるための別datalist（re-added — this was lost in an earlier edit) */}
+      <datalist id={FULLTABLE_MODEL_NAME_DATALIST_ID}>
+        {allKnownModelNamesFromFullTable.map((n) => (
           <option value={n} key={n} />
         ))}
       </datalist>
