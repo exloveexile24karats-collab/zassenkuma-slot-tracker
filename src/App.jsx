@@ -1304,7 +1304,6 @@ export default function SlotDataTracker() {
   // it's pulled live from the shared dateEventMap registry at save time.
   useEffect(() => {
     setSelectedMachines([]);
-    setPasteText("");
     setStatus(null);
     setConfirmDeleteDate(null);
   }, [activePageId]);
