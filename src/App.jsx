@@ -110,7 +110,10 @@ const DIGIT7_COLOR = "#f6a04d";
 // データが見えなくなっていた問題を修正。起動時に旧キー（分割前の1本化
 // キー）にデータが残っていれば、自動で新しい日付ごとのキーに移行し、
 // 旧キーは削除する一回限りのマイグレーションを追加。
-const APP_VERSION = "6.8.2";
+// v6.8.3: v6.8.2の移行処理が失敗を黙って握りつぶしており、実際に移行に
+// 失敗しても画面上は何も表示されない問題があった。移行の結果（成功件数・
+// 失敗内容・JSON解析エラー等）を画面上部に必ずバナー表示するように変更。
+const APP_VERSION = "6.8.3";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1153,6 +1156,7 @@ export default function SlotDataTracker() {
   // once its page is created. ----
   const [rawFullTable, setRawFullTable] = useState({}); // { [date]: [{modelName,no,gsuNormal,sada,bb,rb,gousei,bbRateStr,rbRateStr}] }
   const [rawFullTableLoaded, setRawFullTableLoaded] = useState(false);
+  const [rawFullTableMigrationStatus, setRawFullTableMigrationStatus] = useState(null);
   const [fullTableDate, setFullTableDate] = useState(todayStr());
   const [fullTablePasteText, setFullTablePasteText] = useState("");
   const [fullTableStatus, setFullTableStatus] = useState(null);
@@ -1304,26 +1308,57 @@ export default function SlotDataTracker() {
         // key. If that legacy key still has data, split it out into the new
         // per-date keys (any date already present in the new scheme wins,
         // in case this migration runs more than once) and persist the split.
+        // v6.8.2 originally swallowed any failure here silently — v6.8.3
+        // reports the outcome on screen so a failed migration is actually
+        // visible instead of just quietly leaving old data unrecovered.
         try {
           const legacy = await storage.get(LEGACY_RAW_FULLTABLE_KEY, false);
           if (legacy && legacy.value) {
-            const legacyData = JSON.parse(legacy.value);
+            let legacyData;
+            try {
+              legacyData = JSON.parse(legacy.value);
+            } catch (parseErr) {
+              setRawFullTableMigrationStatus({
+                type: "error",
+                msg: `旧データの読み込みに失敗しました（JSON解析エラー：${parseErr.message}）。旧キー "${LEGACY_RAW_FULLTABLE_KEY}" のデータはまだ削除されていません。`,
+              });
+              legacyData = null;
+            }
             if (legacyData && typeof legacyData === "object") {
               const migrationWrites = [];
+              const migratedDates = [];
               Object.entries(legacyData).forEach(([date, rows]) => {
                 if (!(date in next)) {
                   next[date] = rows;
-                  migrationWrites.push(storage.set(rawFullTableKey(date), JSON.stringify(rows), false));
+                  migratedDates.push(date);
+                  migrationWrites.push(
+                    storage.set(rawFullTableKey(date), JSON.stringify(rows), false).then((res) => ({ date, ok: !!res }))
+                  );
                 }
               });
               if (migrationWrites.length > 0) {
-                await Promise.all(migrationWrites);
-                await storage.delete(LEGACY_RAW_FULLTABLE_KEY, false);
+                const results = await Promise.all(migrationWrites);
+                const failed = results.filter((r) => !r.ok).map((r) => r.date);
+                if (failed.length > 0) {
+                  setRawFullTableMigrationStatus({
+                    type: "error",
+                    msg: `旧データの移行中、${failed.length}件の保存に失敗しました（${failed.join(", ")}）。旧キーは安全のため削除していません。`,
+                  });
+                } else {
+                  await storage.delete(LEGACY_RAW_FULLTABLE_KEY, false);
+                  setRawFullTableMigrationStatus({
+                    type: "ok",
+                    msg: `旧形式のデータを${migratedDates.length}件、新しい日付別キーに移行しました（${migratedDates.slice(0, 5).join(", ")}${migratedDates.length > 5 ? " ほか" : ""}）。`,
+                  });
+                }
               }
             }
           }
         } catch (e) {
-          // legacy key missing or unreadable — nothing to migrate
+          setRawFullTableMigrationStatus({
+            type: "error",
+            msg: `旧データの確認中にエラーが発生しました：${e && e.message ? e.message : "不明なエラー"}`,
+          });
         }
 
         setRawFullTable(next);
@@ -3616,6 +3651,24 @@ export default function SlotDataTracker() {
           表を貼り付けるだけで台ごとに自動集計・グラフ化します
         </div>
       </div>
+
+      {rawFullTableMigrationStatus && (
+        <div style={{
+          marginBottom: "14px", padding: "10px 12px", borderRadius: "8px", fontSize: "12px",
+          background: rawFullTableMigrationStatus.type === "ok" ? "#132a1f" : "#2a1418",
+          border: `1px solid ${rawFullTableMigrationStatus.type === "ok" ? "#2c5a3f" : "#7a3038"}`,
+          color: rawFullTableMigrationStatus.type === "ok" ? "#9ece6a" : "#e5697a",
+          display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "10px",
+        }}>
+          <span>🗂 アナスロ旧データ移行：{rawFullTableMigrationStatus.msg}</span>
+          <button
+            onClick={() => setRawFullTableMigrationStatus(null)}
+            style={{ background: "none", border: "none", cursor: "pointer", color: "inherit", flexShrink: 0 }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* page tabs */}
       <div style={{ display: "flex", alignItems: "flex-end", gap: "4px", marginBottom: "0", flexWrap: "wrap" }}>
