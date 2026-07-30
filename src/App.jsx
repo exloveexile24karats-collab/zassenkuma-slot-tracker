@@ -64,6 +64,9 @@ const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,s
 // exceeds the per-key storage size limit, which is exactly what caused
 // saves to start failing once enough days had been pasted in.
 const RAW_FULLTABLE_KEY_PREFIX = "slot-raw-fulltable-v1:";
+// v6.8 used this single key for ALL dates before the v6.8.1 per-date split —
+// kept only so the one-time migration below can recover data saved under it
+const LEGACY_RAW_FULLTABLE_KEY = "slot-raw-fulltable-v1";
 function rawFullTableKey(date) {
   return `${RAW_FULLTABLE_KEY_PREFIX}${date}`;
 }
@@ -97,7 +100,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // （機種別サマリー）は変更なし。出率（shutsu）概念は廃止し、台番号×日付
 // マトリクスは設定判別プロファイル登録済み機種（モンキーターンV・
 // マイジャグラーV）の設定期待度表示に切り替え。
-const APP_VERSION = "6.8";
+// v6.8.1: アナスロの生データ保存先を、全日付をまとめた1つのキーから
+// 日付ごとの個別キーに分割（1キーあたりの容量上限を超えて古い日付の
+// 保存が失敗していた問題の修正）。あわせて民レポ側の日付一覧に
+// 民レポ/アナスロの登録状況表示・クリックでの編集読み込みを追加、
+// アナスロの日付欄も既存データを自動読み込みするように変更、正式名称の
+// 候補元をアナスロに変更。
+// v6.8.2: v6.8.1の分割処理に旧キーからの移行漏れがあり、既存のアナスロ
+// データが見えなくなっていた問題を修正。起動時に旧キー（分割前の1本化
+// キー）にデータが残っていれば、自動で新しい日付ごとのキーに移行し、
+// 旧キーは削除する一回限りのマイグレーションを追加。
+const APP_VERSION = "6.8.2";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1286,6 +1299,33 @@ export default function SlotDataTracker() {
         entries.forEach((e) => {
           if (e) next[e[0]] = e[1];
         });
+
+        // v6.8.1 one-time migration: v6.8 stored every date under ONE shared
+        // key. If that legacy key still has data, split it out into the new
+        // per-date keys (any date already present in the new scheme wins,
+        // in case this migration runs more than once) and persist the split.
+        try {
+          const legacy = await storage.get(LEGACY_RAW_FULLTABLE_KEY, false);
+          if (legacy && legacy.value) {
+            const legacyData = JSON.parse(legacy.value);
+            if (legacyData && typeof legacyData === "object") {
+              const migrationWrites = [];
+              Object.entries(legacyData).forEach(([date, rows]) => {
+                if (!(date in next)) {
+                  next[date] = rows;
+                  migrationWrites.push(storage.set(rawFullTableKey(date), JSON.stringify(rows), false));
+                }
+              });
+              if (migrationWrites.length > 0) {
+                await Promise.all(migrationWrites);
+                await storage.delete(LEGACY_RAW_FULLTABLE_KEY, false);
+              }
+            }
+          }
+        } catch (e) {
+          // legacy key missing or unreadable — nothing to migrate
+        }
+
         setRawFullTable(next);
       } catch (e) {
         // none yet
