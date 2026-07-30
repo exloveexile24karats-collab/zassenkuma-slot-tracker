@@ -269,6 +269,28 @@ function parseFullStoreTable(text) {
   return rows;
 }
 
+// v6.8: inverse of parseFullStoreTable — reconstructs the pasteable
+// tab-separated text for a date already saved in rawFullTable, so picking
+// an existing date can show what's there instead of an empty box
+function serializeFullStoreRows(rows) {
+  return (rows || [])
+    .map((r) => {
+      const gousei = r.gousei === null || r.gousei === undefined ? "-" : `1/${r.gousei}`;
+      return [
+        r.modelName,
+        r.no,
+        r.gsuNormal === null || r.gsuNormal === undefined ? "" : r.gsuNormal,
+        r.sada === null || r.sada === undefined ? "" : r.sada,
+        r.bb === null || r.bb === undefined ? "-" : r.bb,
+        r.rb === null || r.rb === undefined ? "-" : r.rb,
+        gousei,
+        r.bbRateStr || "-",
+        r.rbRateStr || "-",
+      ].join("\t");
+    })
+    .join("\n");
+}
+
 // v6.8: 機種名の表記ゆれを軽く吸収する（"スマスロ"/"S"/"L" などの機種名接頭辞の
 // 有無だけを無視した緩い一致）。完全一致優先、ダメなら接頭辞を落として再比較。
 function normalizeModelNameForMatch(name) {
@@ -4517,12 +4539,26 @@ export default function SlotDataTracker() {
                   <input
                     type="date"
                     value={fullTableDate}
-                    onChange={(e) => setFullTableDate(e.target.value)}
+                    onChange={(e) => {
+                      const newDate = e.target.value;
+                      setFullTableDate(newDate);
+                      const existing = rawFullTable[newDate];
+                      if (existing && existing.length > 0) {
+                        setFullTablePasteText(serializeFullStoreRows(existing));
+                        setFullTableStatus({ type: "ok", msg: `${newDate} は登録済み（${existing.length}台分）です。編集用に読み込みました。` });
+                      } else {
+                        setFullTablePasteText("");
+                        setFullTableStatus(null);
+                      }
+                    }}
                     style={{
                       display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
                       borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
                     }}
                   />
+                  <div style={{ marginTop: "4px", fontSize: "11px", color: rawFullTable[fullTableDate] ? "#9ece6a" : "#5a6272" }}>
+                    {rawFullTable[fullTableDate] ? `この日は登録済み（${rawFullTable[fullTableDate].length}台分）` : "この日はまだ未登録です"}
+                  </div>
                 </div>
                 <textarea
                   className="mono scrollbar"
