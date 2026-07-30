@@ -192,7 +192,18 @@ const DIGIT7_COLOR = "#f6a04d";
 // に無い日付」を探しに行くよう変更。索引が一部の日付だけで固定されてい
 // る状況を再現したテストで、修正前は永久に見つからず、修正後は正しく
 // 復元されることを確認済み。
-const APP_VERSION = "6.8.13";
+// v6.8.14: 設定期待度（SETTING_PROFILES）の検索が正式名称の厳密一致の
+// ままだったため、正式名称をアナスロの表記（例：「モンキーターンV」）に
+// 合わせた時点で、プロファイル名（「スマスロモンキーターンV」）と一致
+// しなくなり、設定期待度マトリクスが全部空欄になっていた。ページ反映の
+// 一致判定（modelNamesMatch、表記ゆれに強い）と同じロジックを使うように
+// 統一。
+// v6.8.15: 個別ページ側に残っていた読み取り専用の「データ入力」パネル
+// （抜け日チェック・当日イベント表示・廃止案内）を削除。同じ情報は
+// 「全体データ」タブの登録済み日付一覧（民レポ/アナスロの状況表示）で
+// 見られるため、重複表示だった。ページ自身の「登録済みの日付」一覧は
+// 引き続き残している。
+const APP_VERSION = "6.8.15";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -490,7 +501,15 @@ function settingLikelihoodScore(table, count, n) {
 // dispatched by the machine's model profile type. Returns null for
 // unprofiled models (falls back to the existing win-rate-based signals only)
 function evaluateSettingLikelihood(officialModelName, observation) {
-  const profile = SETTING_PROFILES[officialModelName];
+  // v6.8.14: was a strict SETTING_PROFILES[officialModelName] lookup, which
+  // broke silently once 正式名称 started being set to アナスロ's exact
+  // spelling ("モンキーターンV") instead of the SETTING_PROFILES key
+  // ("スマスロモンキーターンV") — the page's data linkage (which uses
+  // modelNamesMatch) kept working fine, but this lookup didn't, so the
+  // 設定期待度 matrix went silently blank for every cell. Use the same
+  // flexible matching used everywhere else instead of exact equality.
+  const profileEntry = Object.entries(SETTING_PROFILES).find(([name]) => modelNamesMatch(name, officialModelName));
+  const profile = profileEntry ? profileEntry[1] : null;
   if (!profile) return null;
   const { bb, rb, gsuNormal, recentSadaTrend } = observation;
   if (gsuNormal === null || gsuNormal === undefined) return null;
@@ -3127,7 +3146,7 @@ export default function SlotDataTracker() {
   const pageGridMarks = useMemo(() => {
     const map = {};
     const officialName = currentPage && currentPage.officialName;
-    const profileExists = officialName && SETTING_PROFILES[officialName];
+    const profileExists = officialName && Object.keys(SETTING_PROFILES).some((name) => modelNamesMatch(name, officialName));
     sortedHistory.forEach((h) => {
       h.machines.forEach((m) => {
         if (!map[m.no]) map[m.no] = {};
@@ -5173,70 +5192,7 @@ export default function SlotDataTracker() {
           {unlocked ? (
           <>
           <div className="card" style={{ padding: "18px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "12px", color: "#c7cbd4" }}>
-              データ入力
-            </div>
-
-            <div style={{ display: "flex", gap: "10px", marginBottom: "10px" }}>
-              <div style={{ flex: 1 }}>
-                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
-                <input
-                  type="date"
-                  value={entryDate}
-                  onChange={(e) => setEntryDate(e.target.value)}
-                  style={{
-                    width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
-                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", boxSizing: "border-box",
-                  }}
-                />
-              </div>
-            </div>
-            {entryDateHasExisting && (
-              <div style={{ fontSize: "11px", color: "#e8b34c", marginBottom: "8px", marginTop: "-4px" }}>
-                この日付はすでにデータがあります。保存すると上書きされます。
-              </div>
-            )}
-            {entryDateIsClosed && (
-              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
-                ⚠ この日付は店休日として登録されているため、データは保存できません。
-              </div>
-            )}
-            {dateGapWarning && (
-              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
-                ⚠ 前回の記録（{dateGapWarning.lastDate}）からこの日付までに、{dateGapWarning.missing.length}日分データがありません（
-                {dateGapWarning.missing.join("、")}）。店休日であれば登録しておくとこの警告は出なくなります。
-              </div>
-            )}
-
-            {dateEventMap[entryDate] && (
-              <div style={{
-                fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
-                background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
-                display: "flex", alignItems: "center", gap: "6px",
-              }}>
-                <Flag size={12} />
-                この日のイベント：{dateEventMap[entryDate]}（「📅 イベント登録」で変更できます）
-              </div>
-            )}
-
-            <div style={{
-              fontSize: "12px", color: "#8b93a3", padding: "12px", background: "#12161d",
-              border: "1px solid #2a323f", borderRadius: "8px", lineHeight: 1.6,
-            }}>
-              v6.8より、機種ごとの個別入力は廃止しました。データは「📊 全体データ」タブの「🗂 全体入力（一括貼り付け）」から、店全体の一括表を貼り付けることで、このページを含む全ページに自動で反映されます。
-            </div>
-
-            {status && (
-              <div style={{
-                marginTop: "10px", fontSize: "12px", display: "flex", alignItems: "flex-start", gap: "6px",
-                color: status.type === "ok" ? "#9ece6a" : "#e5697a",
-              }}>
-                {status.type === "ok" ? <CheckCircle2 size={14} style={{ marginTop: 1 }} /> : <AlertCircle size={14} style={{ marginTop: 1 }} />}
-                <span>{status.msg}</span>
-              </div>
-            )}
-
-            <div style={{ marginTop: "18px", borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
+            <div style={{ marginTop: "0", borderTop: "none", paddingTop: "0" }}>
               <button
                 onClick={() => setDateListOpen((v) => !v)}
                 style={{
