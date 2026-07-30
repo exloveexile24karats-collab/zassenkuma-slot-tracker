@@ -208,7 +208,20 @@ const DIGIT7_COLOR = "#f6a04d";
 // フィンガープリントで、保存時に他の登録済み日付と完全一致していないか
 // チェックし、一致していれば警告（無視して保存も選べる）。あわせて、
 // 登録済み全日付を対象にした一括の重複チェックボタンも追加。
-const APP_VERSION = "6.8.16";
+// v6.8.17: マイジャグラーVの理論値を微修正（設定4のREG確率・合成確率）。
+// 設定期待度スコアに「回転数（G数）が多いほど信頼度が上がる」という要素
+// を数値自体に織り込んだ。具体的には、期待発生回数（G数×平均確率）が
+// 少ないうちはスコアを50（中立）寄りに縮め、経験的な目安である約25回相当
+// の発生数に達すると生の判定値をそのまま反映するようにした。AT型に
+// あった固定0.6倍の縮小は、この仕組みに置き換わったため削除。
+// v6.8.18: 甲鉄城のカバネリ・東京喰種の設定判別プロファイルを追加（両方
+// ともRB確率＋差枚トレンド。カバネリは5:5、喰種は出玉重めの3:7、いずれも
+// 暫定・推奨値）。あわせて、AT型プロファイルの差枚トレンドが実は一度も
+// 実データと接続されていなかった（recentSadaTrendが常にundefinedだった）
+// のを修正：各台の直近7日平均差枚とその台自身の長期平均を比較したトレンド
+// を実際に計算して渡すようにした。設定期待度マトリクスの配色も、赤＞黄＞
+// 緑＞青＞灰の5段階ルールに統一。
+const APP_VERSION = "6.8.18";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -269,6 +282,20 @@ function markColor(mark) {
   if (mark === "☆" || mark === "◎") return "#e5484d";
   if (mark === "◯") return "#f2d24b";
   return "#9ece6a"; // ▲
+}
+
+// v6.8.18: shared 5-段階 strength scale (赤＞黄＞緑＞青＞灰、高いほど赤) —
+// this is the house convention going forward for anything with a strength
+// gradient (今のところ設定期待度のみ、他の指標もこの配色に合わせる予定)
+function fiveBandColor(score0to100) {
+  if (score0to100 >= 75) return "#e5697a"; // 赤
+  if (score0to100 >= 60) return "#e8b34c"; // 黄
+  if (score0to100 >= 45) return "#9ece6a"; // 緑
+  if (score0to100 >= 30) return "#7aa2f7"; // 青
+  return "#5a6272"; // 灰
+}
+function settingScoreColor(score0to1) {
+  return fiveBandColor(Math.round(score0to1 * 100));
 }
 
 // parse a store-wide summary table: 機種名(or 末尾)\t平均差枚\t平均G数\t勝率(x/y)\t出率
@@ -461,6 +488,7 @@ const SETTING_PROFILES = {
       { setting: 5, rate: 1 / 235.7 },
       { setting: 6, rate: 1 / 222.9 },
     ],
+    trendWeight: 0.4, // 初当たり6:差枚トレンド4
   },
   マイジャグラーV: {
     type: "A",
@@ -469,7 +497,7 @@ const SETTING_PROFILES = {
       { setting: 1, rate: 1 / 163.8 },
       { setting: 2, rate: 1 / 159.1 },
       { setting: 3, rate: 1 / 148.6 },
-      { setting: 4, rate: 1 / 135.4 },
+      { setting: 4, rate: 1 / 135.2 },
       { setting: 5, rate: 1 / 126.8 },
       { setting: 6, rate: 1 / 114.6 },
     ],
@@ -477,10 +505,36 @@ const SETTING_PROFILES = {
       { setting: 1, rate: 1 / 409.6 },
       { setting: 2, rate: 1 / 385.5 },
       { setting: 3, rate: 1 / 336.1 },
-      { setting: 4, rate: 1 / 290.0 },
+      { setting: 4, rate: 1 / 290.1 },
       { setting: 5, rate: 1 / 268.6 },
       { setting: 6, rate: 1 / 229.1 },
     ],
+  },
+  "甲鉄城のカバネリ 海門(うなと)決戦": {
+    type: "AT",
+    // RB確率。ユーザー提供の実測値。出玉トレンドとの比重は5:5（暫定・推奨値）。
+    atHitTable: [
+      { setting: 1, rate: 1 / 254.2 },
+      { setting: 2, rate: 1 / 242.3 },
+      { setting: 3, rate: 1 / 239.6 },
+      { setting: 4, rate: 1 / 214.0 },
+      { setting: 5, rate: 1 / 203.2 },
+      { setting: 6, rate: 1 / 195.1 },
+    ],
+    trendWeight: 0.5, // RB確率5:差枚トレンド5（暫定・推奨値）
+  },
+  東京喰種: {
+    type: "AT",
+    // RB確率。ユーザー提供の実測値。出玉トレンドの比重を重め（3:7、暫定・推奨値）。
+    atHitTable: [
+      { setting: 1, rate: 1 / 262.6 },
+      { setting: 2, rate: 1 / 255.6 },
+      { setting: 3, rate: 1 / 246.5 },
+      { setting: 4, rate: 1 / 233.1 },
+      { setting: 5, rate: 1 / 216.4 },
+      { setting: 6, rate: 1 / 203.7 },
+    ],
+    trendWeight: 0.7, // RB確率3:差枚トレンド7（出玉重め、暫定・推奨値）
   },
 };
 
@@ -500,7 +554,14 @@ function poissonLogLikelihood(count, n, rate) {
 // turns a table of {setting, rate} + an observation into a 0-1 "confidence
 // toward high settings" score: softmax over the per-setting likelihoods,
 // then a weighted average of setting number (normalized to 0-1 across the
-// table's min/max setting) — smooth/graduated by construction, not a cliff
+// table's min/max setting) — smooth/graduated by construction, not a cliff.
+// v6.8.17: the raw poisson math already gets sharper with more games, but
+// with a small sample a single lucky/unlucky stretch could still swing the
+// normalized value to an extreme. Explicitly shrink toward neutral (0.5)
+// based on the EXPECTED event count so far (n × average table rate, not
+// raw G数 — this way a rare AT-hit table and a frequent A-type bonus table
+// both reach full confidence around the same number of actual observed
+// events, roughly 25, a common rule-of-thumb minimum for a stable estimate).
 function settingLikelihoodScore(table, count, n) {
   if (!n || n < 300) return null; // too little play to say anything meaningful yet
   const logLiks = table.map((t) => ({ setting: t.setting, ll: poissonLogLikelihood(count, n, t.rate) }));
@@ -512,8 +573,12 @@ function settingLikelihoodScore(table, count, n) {
   const minS = Math.min(...settings);
   const maxS = Math.max(...settings);
   const expectedSetting = weights.reduce((a, w) => a + (w.w / totalW) * w.setting, 0);
-  const normalized = maxS > minS ? (expectedSetting - minS) / (maxS - minS) : 0.5;
-  return { expectedSetting, normalized, sampleSize: n };
+  const rawNormalized = maxS > minS ? (expectedSetting - minS) / (maxS - minS) : 0.5;
+  const avgRate = table.reduce((a, t) => a + t.rate, 0) / table.length;
+  const expectedEvents = n * avgRate;
+  const confidence = Math.max(0, Math.min(1, expectedEvents / 25));
+  const normalized = 0.5 + (rawNormalized - 0.5) * confidence;
+  return { expectedSetting, normalized, confidence, sampleSize: n };
 }
 
 // combined per-machine 設定期待度 (0-1, higher = more likely a good setting),
@@ -534,21 +599,22 @@ function evaluateSettingLikelihood(officialModelName, observation) {
   if (gsuNormal === null || gsuNormal === undefined) return null;
 
   if (profile.type === "AT") {
-    // RB = AT初当たり回数. Confidence is graded down further (extra
-    // shrinkage toward 0.5) because hit-rate alone is noisy for a
-    // heavy/rare-hit machine — 差枚トレンドを合わせて最終スコアにする
+    // RB = 初当たり回数 (AT初当たり or RB確率、機種のプロファイルに依存).
+    // v6.8.17: the fixed extra shrinkage here used to compensate for
+    // small-sample noise with one constant factor regardless of actual G数
+    // — now that settingLikelihoodScore shrinks based on the real expected
+    // event count, that's handled properly there instead.
     if (rb === null || rb === undefined) return null;
     const hitScore = settingLikelihoodScore(profile.atHitTable, rb, gsuNormal);
     if (!hitScore) return null;
-    // shrink toward 0.5 (neutral) to reflect the higher variance of a rare event
-    const shrunk = 0.5 + (hitScore.normalized - 0.5) * 0.6;
-    let combined = shrunk;
+    const trendWeight = typeof profile.trendWeight === "number" ? profile.trendWeight : 0.4; // v6.8.18: per-機種の初当たり/RB確率 vs 差枚トレンドの比重
+    let combined = hitScore.normalized;
     if (typeof recentSadaTrend === "number") {
       // recentSadaTrend expected pre-normalized to roughly [-1, 1]
       const trendComponent = Math.max(0, Math.min(1, 0.5 + recentSadaTrend * 0.5));
-      combined = shrunk * 0.6 + trendComponent * 0.4;
+      combined = hitScore.normalized * (1 - trendWeight) + trendComponent * trendWeight;
     }
-    return { score: combined, expectedSetting: hitScore.expectedSetting, sampleSize: gsuNormal, basis: "AT初当たり＋差枚トレンド" };
+    return { score: combined, expectedSetting: hitScore.expectedSetting, sampleSize: gsuNormal, basis: "初当たり／RB確率＋差枚トレンド" };
   }
 
   if (profile.type === "A") {
@@ -3201,24 +3267,49 @@ export default function SlotDataTracker() {
     const map = {};
     const officialName = currentPage && currentPage.officialName;
     const profileExists = officialName && Object.keys(SETTING_PROFILES).some((name) => modelNamesMatch(name, officialName));
+    if (!profileExists) {
+      sortedHistory.forEach((h) => {
+        h.machines.forEach((m) => {
+          if (!map[m.no]) map[m.no] = {};
+          map[m.no][h.date] = null;
+        });
+      });
+      return map;
+    }
+
+    // v6.8.18: build each machine's own chronological 差枚 series first, so
+    // we can feed evaluateSettingLikelihood an actual recentSadaTrend
+    // (trailing few days vs this machine's own longer baseline, normalized
+    // to roughly [-1, 1]) instead of leaving it undefined — previously the
+    // AT-type profiles' 差枚トレンド blending was designed but never
+    // actually wired to real data here.
+    const seriesByNo = {};
     sortedHistory.forEach((h) => {
       h.machines.forEach((m) => {
-        if (!map[m.no]) map[m.no] = {};
-        if (!profileExists) {
-          map[m.no][h.date] = null;
-          return;
+        if (!seriesByNo[m.no]) seriesByNo[m.no] = [];
+        seriesByNo[m.no].push({ date: h.date, sada: m.sada, bb: m.bb, rb: m.rb, gsu: m.gsu });
+      });
+    });
+
+    Object.entries(seriesByNo).forEach(([no, series]) => {
+      map[no] = {};
+      series.forEach((entry, i) => {
+        const recentWindow = series.slice(Math.max(0, i - 6), i + 1); // trailing 7 days including today
+        const baselineWindow = series.slice(0, i + 1);
+        let recentSadaTrend;
+        if (recentWindow.length >= 3 && baselineWindow.length >= 5) {
+          const recentAvg = recentWindow.reduce((a, s) => a + (s.sada || 0), 0) / recentWindow.length;
+          const baselineAvg = baselineWindow.reduce((a, s) => a + (s.sada || 0), 0) / baselineWindow.length;
+          const typicalMag = baselineWindow.reduce((a, s) => a + Math.abs(s.sada || 0), 0) / baselineWindow.length || 1;
+          recentSadaTrend = Math.max(-1, Math.min(1, (recentAvg - baselineAvg) / typicalMag));
         }
-        const result = evaluateSettingLikelihood(officialName, { bb: m.bb, rb: m.rb, gsuNormal: m.gsu });
+        const result = evaluateSettingLikelihood(officialName, { bb: entry.bb, rb: entry.rb, gsuNormal: entry.gsu, recentSadaTrend });
         if (!result) {
-          map[m.no][h.date] = null;
+          map[no][entry.date] = null;
           return;
         }
         const pct = Math.round(result.score * 100);
-        // green (high) <-> gray (mid) <-> red (low), interpolated
-        const color = result.score >= 0.5
-          ? `rgb(${Math.round(199 - (result.score - 0.5) * 2 * (199 - 158))}, ${Math.round(203 + (result.score - 0.5) * 2 * (206 - 203))}, ${Math.round(203 - (result.score - 0.5) * 2 * 100)})`
-          : `rgb(${Math.round(199 + (0.5 - result.score) * 2 * (229 - 199))}, ${Math.round(203 - (0.5 - result.score) * 2 * 100)}, ${Math.round(203 - (0.5 - result.score) * 2 * 90)})`;
-        map[m.no][h.date] = { label: String(pct), color };
+        map[no][entry.date] = { label: String(pct), color: settingScoreColor(result.score) };
       });
     });
     return map;
