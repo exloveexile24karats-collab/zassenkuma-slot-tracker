@@ -182,7 +182,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // いた。民レポの日付一覧から該当する月を割り出し、月別キーが残っていれ
 // ば日付ごとに分割・移行する処理を追加。実際に月別キー形式のデータを
 // 使ったテストで、正しく復元されることを確認済み。
-const APP_VERSION = "6.8.12";
+// v6.8.13: v6.8.11〜v6.8.12の復元処理は「索引キーが存在しない時だけ」
+// 実行される一回限りのブートストラップだった。もし過去に索引がごく一部
+// の日付（例：1日分）だけで一度でも作られてしまっていた場合、それ以降は
+// 「索引があるからもう探さなくていい」と判断し、他の場所に残っている
+// データを二度と探しに行かなくなる欠陥があった（アップデートのたびに
+// データが消えたように見えた本当の原因はこれだったと思われる）。索引の
+// 有無に関わらず、民レポの日付一覧と毎回突き合わせて「本来あるはずなの
+// に無い日付」を探しに行くよう変更。索引が一部の日付だけで固定されてい
+// る状況を再現したテストで、修正前は永久に見つからず、修正後は正しく
+// 復元されることを確認済み。
+const APP_VERSION = "6.8.13";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1419,27 +1429,34 @@ export default function SlotDataTracker() {
               msg: `アナスロの一部データ（${failedDates.join(", ")}）の読み込みに失敗しました。ページを再読み込みしてみてください。`,
             });
           }
-        } else {
-          // v6.8.11 one-time bootstrap: no index yet — this either means a
-          // genuinely brand-new store, or leftover data from before the
-          // index existed (v6.8's single blob key, or v6.8.1〜v6.8.10's
-          // per-date/month keys with no index to find them by). Use 民レポ's
-          // own date list (already known, no list() needed) as the set of
-          // candidate dates to probe — this is exactly the same naming as
-          // the current per-date scheme, so any that exist are found directly.
-          let candidateDates = [];
-          try {
-            const r6 = await storage.get(OVERALL_SUMMARY_KEY, false);
-            if (r6 && r6.value) {
-              const val = JSON.parse(r6.value);
-              if (Array.isArray(val)) candidateDates = val.map((s) => s.date).filter(Boolean);
-            }
-          } catch (e) {
-            // no 民レポ dates to use as candidates — bootstrap will just rely on the legacy blob below
-          }
+        }
 
+        // v6.8.13: this recovery scan now runs whenever 民レポ has dates
+        // that アナスロ doesn't (NOT only when the index is entirely
+        // missing). v6.8.11/6.8.12 only ever ran this once, gated on the
+        // index being totally absent — so if the index existed but was
+        // badly incomplete (e.g. only ever got one date written into it
+        // before a past bug interrupted things), every later load just
+        // trusted that incomplete index forever and never looked for the
+        // rest again. Comparing against 民レポ's own date list every time
+        // catches that instead of silently accepting a stale, partial index.
+        let candidateDates = [];
+        try {
+          const r6 = await storage.get(OVERALL_SUMMARY_KEY, false);
+          if (r6 && r6.value) {
+            const val = JSON.parse(r6.value);
+            if (Array.isArray(val)) candidateDates = val.map((s) => s.date).filter(Boolean);
+          }
+        } catch (e) {
+          // no 民レポ dates available — nothing to reconcile against this time
+        }
+        const missingDates = candidateDates.filter((d) => !(d in next));
+
+        if (missingDates.length > 0) {
+          // 1. probe this exact per-date key naming directly (covers
+          // v6.8.1〜v6.8.4 and v6.8.11+ leftovers/gaps)
           const probeResults = await Promise.all(
-            candidateDates.map(async (date) => {
+            missingDates.map(async (date) => {
               try {
                 const r = await storage.get(rawFullTableDateKey(date), false);
                 if (!r || !r.value) return null;
@@ -1450,17 +1467,19 @@ export default function SlotDataTracker() {
             })
           );
           probeResults.forEach((r) => {
-            if (r) next[r.date] = r.rows;
+            if (r) {
+              next[r.date] = r.rows;
+              indexNeedsWrite = true;
+            }
           });
 
-          // v6.8.11 bootstrap addition: v6.8.5〜v6.8.10 briefly used MONTH-
-          // bucket keys ("slot-raw-fulltable-v1:YYYY-MM", an object of
-          // {date: rows}) before that scheme was found to exceed the real
-          // ~1MB per-value limit. Any month successfully saved during that
-          // window is real data sitting under that key name — check the
-          // months actually represented in 民レポ's date list (not a blind
-          // many-month probe) and split each one found into per-day entries.
-          const candidateMonthsFromDates = Array.from(new Set(candidateDates.map((d) => monthOf(d)))).filter(Boolean);
+          // 2. v6.8.5〜v6.8.10 briefly used MONTH-bucket keys
+          // ("slot-raw-fulltable-v1:YYYY-MM", an object of {date: rows})
+          // before that scheme was found to exceed the real ~1MB per-value
+          // limit. Check the months actually represented among still-
+          // missing dates and split any found bucket into per-day entries.
+          const stillMissingAfterProbe = missingDates.filter((d) => !(d in next));
+          const candidateMonthsFromDates = Array.from(new Set(stillMissingAfterProbe.map((d) => monthOf(d)))).filter(Boolean);
           const monthBucketResults = await Promise.all(
             candidateMonthsFromDates.map(async (mo) => {
               const k = `${RAW_FULLTABLE_KEY_PREFIX}${mo}`;
@@ -1482,6 +1501,7 @@ export default function SlotDataTracker() {
               if (date in next) return; // per-day probe already found this date
               next[date] = rows;
               monthBucketMigratedCount += 1;
+              indexNeedsWrite = true;
               monthBucketDateWrites.push(storage.set(rawFullTableDateKey(date), JSON.stringify(rows), false).then((res) => ({ date, ok: !!res })));
             });
             monthBucketKeysToDelete.push(m.key);
@@ -1503,7 +1523,7 @@ export default function SlotDataTracker() {
             }
           }
 
-          // also fold in the v6.8 single shared blob, if it's still there
+          // 3. also fold in the v6.8 single shared blob, if it's still there
           try {
             const legacy = await storage.get(LEGACY_RAW_FULLTABLE_KEY, false);
             if (legacy && legacy.value) {
@@ -1524,6 +1544,7 @@ export default function SlotDataTracker() {
                   if (date in next) return;
                   next[date] = rows;
                   migratedCount += 1;
+                  indexNeedsWrite = true;
                   dateWrites.push(storage.set(rawFullTableDateKey(date), JSON.stringify(rows), false).then((res) => ({ date, ok: !!res })));
                 });
                 if (migratedCount > 0) {
@@ -1549,16 +1570,14 @@ export default function SlotDataTracker() {
               prev || { type: "error", msg: `旧データの確認中にエラーが発生しました：${e && e.message ? e.message : "不明なエラー"}` }
             );
           }
-
-          indexNeedsWrite = true; // build & persist the index now that we've reconstructed it from scratch
         }
 
         rawFullTableIndexRef.current = Object.keys(next).sort();
-        if (indexNeedsWrite) {
+        if (indexNeedsWrite || knownDates === null) {
           try {
             await storage.set(RAW_FULLTABLE_INDEX_KEY, JSON.stringify(rawFullTableIndexRef.current), false);
           } catch (e) {
-            // if this fails, the next load will just re-bootstrap the same way — not fatal
+            // if this fails, the next load will just re-attempt the same reconciliation — not fatal
           }
         }
 
