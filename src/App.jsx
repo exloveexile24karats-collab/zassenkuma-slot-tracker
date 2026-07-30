@@ -4422,7 +4422,7 @@ export default function SlotDataTracker() {
           {unlocked ? (
             <div className="card" style={{ padding: "18px" }}>
               <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-                データ入力（機種別サマリー＋末尾別データ）
+                民レポ
               </div>
               <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
                 両方の表をそのまま1つに貼り付けてください（「末尾別データ」の行で自動的に区切ります）。日付にはイベント登録の内容が自動で反映されます。
@@ -4478,7 +4478,7 @@ export default function SlotDataTracker() {
 
               <div style={{ marginTop: "20px", borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
                 <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-                  🗂 全体入力（一括貼り付け・v6.8）
+                  🗂 アナスロ
                 </div>
                 <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
                   機種名・台番号・G数（通常時）・差枚・BB・RB・合成確率・BB確率・RB確率の一覧表を、店全体分まとめて貼り付けます。正式名称が一致するページ全部に自動反映されます（機種ごとの個別入力は廃止しました）。G数は通常時のみのため、出率（☆◎◯▲マーク）はこの経路では計算されません。
