@@ -230,7 +230,21 @@ const DIGIT7_COLOR = "#f6a04d";
 // 回数に基づく）に応じて2:8（信頼度低い）〜8:2（信頼度高い）にスライド
 // する方式に統一。RB確率を「低設定の誤爆を弾く／高設定の不運を過小評価
 // しない」ためのフィルターとして使う、という設計意図に合わせた。
-const APP_VERSION = "6.8.19";
+// v6.8.20: 修正後の正しいスコアを使って、自己ホット台・期待外れの反動・
+// 連続マイナス日数・谷間・反持続性・7日間スコア・差枚との掛け合わせを
+// 全部再検証したが、ほぼ全部が誤差レベルまで縮小・消失した。唯一
+// 「今日が強いイベント日かどうか」だけが3/4機種で+1.6〜3.1pt程度の一貫
+// した効果を残したため、設定期待度スコア自体に小さな補正（+0.02）として
+// 追加。ピックアップのS-Gグレード側には追加していない（既存の勝率ベース
+// のイベント登録連動基準と重複するため）。
+// v6.8.21: 新台入れ替え等で物理的な台番号の中身が別機種に変わり、最新日
+// のデータには一切出てこなくなった台番号（例：喰種の328番＝5/1〜6/9のみ、
+// カバネリの256番＝5/14〜6/29のみ）が、「本日のピックアップ」に紛れ込んで
+// いた。ページの最新登録日に実際に存在する台番号だけをピックアップ表示の
+// 対象にするよう変更（本日のピックアップ・全機種横断ピックアップの両方）。
+// バックテスト・設定投入率の算出など、それ以外の集計はこれまで通り全履歴
+// を使用（表示だけの絞り込み）。
+const APP_VERSION = "6.8.21";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -604,8 +618,19 @@ function evaluateSettingLikelihood(officialModelName, observation) {
   const profileEntry = Object.entries(SETTING_PROFILES).find(([name]) => modelNamesMatch(name, officialModelName));
   const profile = profileEntry ? profileEntry[1] : null;
   if (!profile) return null;
-  const { bb, rb, gsuNormal, recentSadaTrend } = observation;
+  const { bb, rb, gsuNormal, recentSadaTrend, isStrongEventDay } = observation;
   if (gsuNormal === null || gsuNormal === undefined) return null;
+
+  // v6.8.20: after re-testing extensively against the corrected (v6.8.19)
+  // score — walk-forward "自己ホット台", "期待外れの反動", 連続マイナス日数,
+  // 谷間, 反持続性, 7日間スコア, 差枚との掛け合わせ — only one held up with
+  // a consistent, non-trivial effect across most machines: 今日が強い
+  // イベント日かどうか (+1.6〜3.1pt on a 0-100 scale for 3 of 4 profiled
+  // machines). Applied here as a small direct boost to 設定期待度 itself,
+  // NOT as a new ピックアップ point (that would double-count against the
+  // existing win-rate-based イベント登録連動 signal, which already covers
+  // this).
+  const strongEventBoost = isStrongEventDay ? 0.02 : 0;
 
   if (profile.type === "AT") {
     // RB = 初当たり回数 (AT初当たり or RB確率、機種のプロファイルに依存).
@@ -626,7 +651,12 @@ function evaluateSettingLikelihood(officialModelName, observation) {
       const trendComponent = Math.max(0, Math.min(1, 0.5 + recentSadaTrend * 0.5));
       combined = hitScore.normalized * probWeight + trendComponent * (1 - probWeight);
     }
-    return { score: combined, expectedSetting: hitScore.expectedSetting, sampleSize: gsuNormal, basis: "初当たり／RB確率＋出玉（信頼度スライド）" };
+    return {
+      score: Math.max(0, Math.min(1, combined + strongEventBoost)),
+      expectedSetting: hitScore.expectedSetting,
+      sampleSize: gsuNormal,
+      basis: "初当たり／RB確率＋出玉（信頼度スライド）",
+    };
   }
 
   if (profile.type === "A") {
@@ -639,7 +669,12 @@ function evaluateSettingLikelihood(officialModelName, observation) {
     const parts = [combinedScore, rbScore].filter(Boolean);
     const score = parts.reduce((a, p) => a + p.normalized, 0) / parts.length;
     const expectedSetting = parts.reduce((a, p) => a + p.expectedSetting, 0) / parts.length;
-    return { score, expectedSetting, sampleSize: gsuNormal, basis: "合成確率＋RB確率" };
+    return {
+      score: Math.max(0, Math.min(1, score + strongEventBoost)),
+      expectedSetting,
+      sampleSize: gsuNormal,
+      basis: "合成確率＋RB確率",
+    };
   }
 
   return null;
@@ -3059,7 +3094,17 @@ export default function SlotDataTracker() {
   }
 
   const pickList = useMemo(() => {
-    return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet));
+    const results = computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet);
+    // v6.8.21: exclude machines that no longer appear in the most recent
+    // registered date (e.g. 新台入れ替え replaced this physical slot with a
+    // different model, so its number lingers in the page's own machine
+    // history but hasn't had real data in weeks) — this is a display-only
+    // filter for "today's pickup"; backtesting/設定投入率 elsewhere still
+    // uses this machine's full historical data as before.
+    const latestEntry = sortedHistory.length > 0 ? sortedHistory[sortedHistory.length - 1] : null;
+    const activeNos = latestEntry ? new Set(latestEntry.machines.map((m) => m.no)) : null;
+    const filtered = activeNos ? results.filter((r) => activeNos.has(r.no)) : results;
+    return sortPickResults(filtered);
   }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends]);
 
   // hall-wide: every page's machines combined into ONE ranked list, no
@@ -3086,8 +3131,12 @@ export default function SlotDataTracker() {
           .map((h) => h.date)
       );
       const pageResults = computeSignalsForPage(machineNos, sorted, hbd, recs, pStrongDateSet, pSemiDateSet, strongEventNameSet, semiEventNameSet);
+      // v6.8.21: same stale-machine exclusion as pickList, per page
+      const latestEntry = sorted.length > 0 ? sorted[sorted.length - 1] : null;
+      const activeNos = latestEntry ? new Set(latestEntry.machines.map((m) => m.no)) : null;
+      const filteredPageResults = activeNos ? pageResults.filter((r) => activeNos.has(r.no)) : pageResults;
       const pageLabel = p.name && p.name.trim() ? p.name : `機種${i + 1}`;
-      pageResults.forEach((r) => combined.push({ ...r, pageId: p.id, pageLabel }));
+      filteredPageResults.forEach((r) => combined.push({ ...r, pageId: p.id, pageLabel }));
     });
     return sortPickResults(combined);
   }, [pages, pageHistories, pageRecommends, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap]);
@@ -3316,11 +3365,17 @@ export default function SlotDataTracker() {
     const modelAvgSada = modelSadaCount ? modelSadaSum / modelSadaCount : 0;
     const modelTypicalMag = modelSadaCount ? modelSadaAbsSum / modelSadaCount || 1 : 1;
 
+    // v6.8.20: 今日が強いイベント日かどうか（唯一、再検証後も残った効果）
+    const strongEventDateSet = new Set(
+      sortedHistory.filter((h) => splitEventNames(h.event).some((n) => strongEventColorByName[n])).map((h) => h.date)
+    );
+
     Object.entries(seriesByNo).forEach(([no, series]) => {
       map[no] = {};
       series.forEach((entry) => {
         const recentSadaTrend = Math.max(-1, Math.min(1, ((entry.sada || 0) - modelAvgSada) / modelTypicalMag));
-        const result = evaluateSettingLikelihood(officialName, { bb: entry.bb, rb: entry.rb, gsuNormal: entry.gsu, recentSadaTrend });
+        const isStrongEventDay = strongEventDateSet.has(entry.date);
+        const result = evaluateSettingLikelihood(officialName, { bb: entry.bb, rb: entry.rb, gsuNormal: entry.gsu, recentSadaTrend, isStrongEventDay });
         if (!result) {
           map[no][entry.date] = null;
           return;
@@ -3330,7 +3385,7 @@ export default function SlotDataTracker() {
       });
     });
     return map;
-  }, [sortedHistory, currentPage]);
+  }, [sortedHistory, currentPage, strongEventColorByName]);
 
   const overallModelPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
