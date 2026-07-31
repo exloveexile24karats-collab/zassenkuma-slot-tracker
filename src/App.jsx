@@ -221,7 +221,16 @@ const DIGIT7_COLOR = "#f6a04d";
 // のを修正：各台の直近7日平均差枚とその台自身の長期平均を比較したトレンド
 // を実際に計算して渡すようにした。設定期待度マトリクスの配色も、赤＞黄＞
 // 緑＞青＞灰の5段階ルールに統一。
-const APP_VERSION = "6.8.18";
+// v6.8.19: v6.8.18の「直近7日平均」は、9のつく日のような単日イベントの
+// 効果を1週間に薄めてしまい、実測（勝率ベースでは明確に効くと分かって
+// いる）と食い違う原因になっていた。設計をやり直し：(1)出玉部分は「その日
+// 自身の差枚」を「その機種全体・全期間の平均差枚」と比較する形に変更
+// （7日平均・自己平均のどちらでもなく、機種全体の基準と比較）。(2) RB確率
+// と出玉の混ぜ方も、機種ごとの固定比率（60:40等）をやめ、信頼度（期待発生
+// 回数に基づく）に応じて2:8（信頼度低い）〜8:2（信頼度高い）にスライド
+// する方式に統一。RB確率を「低設定の誤爆を弾く／高設定の不運を過小評価
+// しない」ためのフィルターとして使う、という設計意図に合わせた。
+const APP_VERSION = "6.8.19";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -488,7 +497,9 @@ const SETTING_PROFILES = {
       { setting: 5, rate: 1 / 235.7 },
       { setting: 6, rate: 1 / 222.9 },
     ],
-    trendWeight: 0.4, // 初当たり6:差枚トレンド4
+    // v6.8.19: trendWeight fields removed — AT-type profiles now all share
+    // the same confidence-based 2:8〜8:2 sliding weight (see
+    // evaluateSettingLikelihood) instead of a fixed per-機種 ratio.
   },
   マイジャグラーV: {
     type: "A",
@@ -512,7 +523,7 @@ const SETTING_PROFILES = {
   },
   "甲鉄城のカバネリ 海門(うなと)決戦": {
     type: "AT",
-    // RB確率。ユーザー提供の実測値。出玉トレンドとの比重は5:5（暫定・推奨値）。
+    // RB確率。ユーザー提供の実測値。
     atHitTable: [
       { setting: 1, rate: 1 / 254.2 },
       { setting: 2, rate: 1 / 242.3 },
@@ -521,11 +532,10 @@ const SETTING_PROFILES = {
       { setting: 5, rate: 1 / 203.2 },
       { setting: 6, rate: 1 / 195.1 },
     ],
-    trendWeight: 0.5, // RB確率5:差枚トレンド5（暫定・推奨値）
   },
   東京喰種: {
     type: "AT",
-    // RB確率。ユーザー提供の実測値。出玉トレンドの比重を重め（3:7、暫定・推奨値）。
+    // RB確率。ユーザー提供の実測値。
     atHitTable: [
       { setting: 1, rate: 1 / 262.6 },
       { setting: 2, rate: 1 / 255.6 },
@@ -534,7 +544,6 @@ const SETTING_PROFILES = {
       { setting: 5, rate: 1 / 216.4 },
       { setting: 6, rate: 1 / 203.7 },
     ],
-    trendWeight: 0.7, // RB確率3:差枚トレンド7（出玉重め、暫定・推奨値）
   },
 };
 
@@ -600,21 +609,24 @@ function evaluateSettingLikelihood(officialModelName, observation) {
 
   if (profile.type === "AT") {
     // RB = 初当たり回数 (AT初当たり or RB確率、機種のプロファイルに依存).
-    // v6.8.17: the fixed extra shrinkage here used to compensate for
-    // small-sample noise with one constant factor regardless of actual G数
-    // — now that settingLikelihoodScore shrinks based on the real expected
-    // event count, that's handled properly there instead.
+    // v6.8.19: replaced the fixed per-機種 trendWeight (60:40 etc.) with a
+    // confidence-based SLIDE between 2:8 (low confidence in the RB-rate
+    // read, e.g. low 通常時G数) and 8:2 (high confidence) — the intent
+    // (per the person's own reasoning) is that RB確率 exists specifically
+    // to reject a "lucky payout on a low setting" false positive, so it
+    // should dominate exactly when there's enough G数 to trust it, and
+    // step back in favor of 出玉 when there isn't.
     if (rb === null || rb === undefined) return null;
     const hitScore = settingLikelihoodScore(profile.atHitTable, rb, gsuNormal);
     if (!hitScore) return null;
-    const trendWeight = typeof profile.trendWeight === "number" ? profile.trendWeight : 0.4; // v6.8.18: per-機種の初当たり/RB確率 vs 差枚トレンドの比重
+    const probWeight = 0.2 + hitScore.confidence * 0.6; // 0.2 (low conf) .. 0.8 (high conf)
     let combined = hitScore.normalized;
     if (typeof recentSadaTrend === "number") {
       // recentSadaTrend expected pre-normalized to roughly [-1, 1]
       const trendComponent = Math.max(0, Math.min(1, 0.5 + recentSadaTrend * 0.5));
-      combined = hitScore.normalized * (1 - trendWeight) + trendComponent * trendWeight;
+      combined = hitScore.normalized * probWeight + trendComponent * (1 - probWeight);
     }
-    return { score: combined, expectedSetting: hitScore.expectedSetting, sampleSize: gsuNormal, basis: "初当たり／RB確率＋差枚トレンド" };
+    return { score: combined, expectedSetting: hitScore.expectedSetting, sampleSize: gsuNormal, basis: "初当たり／RB確率＋出玉（信頼度スライド）" };
   }
 
   if (profile.type === "A") {
@@ -3278,31 +3290,36 @@ export default function SlotDataTracker() {
     }
 
     // v6.8.18: build each machine's own chronological 差枚 series first, so
-    // we can feed evaluateSettingLikelihood an actual recentSadaTrend
-    // (trailing few days vs this machine's own longer baseline, normalized
-    // to roughly [-1, 1]) instead of leaving it undefined — previously the
-    // AT-type profiles' 差枚トレンド blending was designed but never
-    // actually wired to real data here.
+    // we can feed evaluateSettingLikelihood an actual trend signal.
+    // v6.8.19 fix: the payout component now compares THAT DAY's own 差枚
+    // against the MODEL-WIDE average (all machines of this model, all
+    // history) rather than either a 7-day trailing average (diluted a
+    // single event day's effect across a week) or each machine's own
+    // historical average (per the confirmed design: "その機種全体の差玉
+    // よりどれだけ差があるか" — the model's overall baseline, not a
+    // per-machine self-baseline).
     const seriesByNo = {};
+    let modelSadaSum = 0;
+    let modelSadaAbsSum = 0;
+    let modelSadaCount = 0;
     sortedHistory.forEach((h) => {
       h.machines.forEach((m) => {
         if (!seriesByNo[m.no]) seriesByNo[m.no] = [];
         seriesByNo[m.no].push({ date: h.date, sada: m.sada, bb: m.bb, rb: m.rb, gsu: m.gsu });
+        if (typeof m.sada === "number") {
+          modelSadaSum += m.sada;
+          modelSadaAbsSum += Math.abs(m.sada);
+          modelSadaCount += 1;
+        }
       });
     });
+    const modelAvgSada = modelSadaCount ? modelSadaSum / modelSadaCount : 0;
+    const modelTypicalMag = modelSadaCount ? modelSadaAbsSum / modelSadaCount || 1 : 1;
 
     Object.entries(seriesByNo).forEach(([no, series]) => {
       map[no] = {};
-      series.forEach((entry, i) => {
-        const recentWindow = series.slice(Math.max(0, i - 6), i + 1); // trailing 7 days including today
-        const baselineWindow = series.slice(0, i + 1);
-        let recentSadaTrend;
-        if (recentWindow.length >= 3 && baselineWindow.length >= 5) {
-          const recentAvg = recentWindow.reduce((a, s) => a + (s.sada || 0), 0) / recentWindow.length;
-          const baselineAvg = baselineWindow.reduce((a, s) => a + (s.sada || 0), 0) / baselineWindow.length;
-          const typicalMag = baselineWindow.reduce((a, s) => a + Math.abs(s.sada || 0), 0) / baselineWindow.length || 1;
-          recentSadaTrend = Math.max(-1, Math.min(1, (recentAvg - baselineAvg) / typicalMag));
-        }
+      series.forEach((entry) => {
+        const recentSadaTrend = Math.max(-1, Math.min(1, ((entry.sada || 0) - modelAvgSada) / modelTypicalMag));
         const result = evaluateSettingLikelihood(officialName, { bb: entry.bb, rb: entry.rb, gsuNormal: entry.gsu, recentSadaTrend });
         if (!result) {
           map[no][entry.date] = null;
