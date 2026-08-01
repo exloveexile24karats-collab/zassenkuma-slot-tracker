@@ -254,7 +254,19 @@ const DIGIT7_COLOR = "#f6a04d";
 // 都度算出）。モンキーターンVの実データで検証したところ、S〜Eグレードで
 // 翌日勝率48.2%→23.3%ときれいに分離することを確認済み。全体データ（民
 // レポ）側のピックアップ・S-Gグレードのロジックは変更していない。
-const APP_VERSION = "6.9";
+// v6.9.1: 新しい実測パターン方式にS〜Gのグレードバッジが表示されていな
+// かった（合計ポイントの数字だけだった）のを追加。バックテストで検証した
+// 区切り（S:60+/A:30+/B:10+/C:-10+/D:-30+/E:それ未満）をそのまま使用。
+// v6.9.2: 2点修正。①民レポの日付ピッカーで未入力の日付を選んでも、直前
+// に選んでいた日付のテキストがそのまま残ってしまい入力しづらかった問題
+// を修正（アナスロ側と同様、未入力なら空欄に、入力済みならその内容を
+// 読み込むように統一。あわせて日付ピッカー操作でもアナスロ側と連動して
+// ジャンプするようにした）。②「登録済みの日付」一覧が民レポの日付だけ
+// から作られており、アナスロを先に入力した日付（民レポ未入力）が一覧に
+// 一切出てこなかった問題を修正。民レポ・アナスロ両方の日付の和集合で一覧
+// を作るように変更し、片方しか無い日付でも「民レポ未登録／アナスロ〇」
+// のように正しく表示されるようにした。
+const APP_VERSION = "6.9.2";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1141,6 +1153,24 @@ const POINT_GRADE_BANDS = [
 function pointsToGrade(points) {
   if (points === null || points === undefined) return null;
   return POINT_GRADE_BANDS.find((b) => points >= b.min).grade;
+}
+
+// v6.9: grade bands for the new symbol-pattern pickup engine — different
+// scale than the old POINT_GRADE_BANDS (this system's points come from
+// summed "実測差×倍率" values, not the old 100-per-strong-signal count).
+// These specific cutoffs are the ones actually backtested on モンキーターンV
+// real data: 翌日勝率 S 48.2% → A 45.6% → B 36.9% → C 33.5% → D 29.9% → E 23.3%.
+const SYMBOL_GRADE_BANDS = [
+  { grade: "S", min: 60 },
+  { grade: "A", min: 30 },
+  { grade: "B", min: 10 },
+  { grade: "C", min: -10 },
+  { grade: "D", min: -30 },
+  { grade: "E", min: -Infinity },
+];
+function symbolPointsToGrade(points) {
+  if (points === null || points === undefined) return null;
+  return SYMBOL_GRADE_BANDS.find((b) => points >= b.min).grade;
 }
 
 // how much weight to give one signal's diff, based on how many historical
@@ -5484,7 +5514,19 @@ export default function SlotDataTracker() {
                 <input
                   type="date"
                   value={overallDate}
-                  onChange={(e) => setOverallDate(e.target.value)}
+                  onChange={(e) => {
+                    const newDate = e.target.value;
+                    setOverallDate(newDate);
+                    const existing = overallSummaries.find((s) => s.date === newDate);
+                    if (existing) {
+                      setOverallPasteText(serializeOverallSummary(existing));
+                      setOverallStatus({ type: "ok", msg: `${newDate} は登録済みです。編集用に読み込みました。` });
+                    } else {
+                      setOverallPasteText("");
+                      setOverallStatus(null);
+                    }
+                    loadFullTableForDate(newDate);
+                  }}
                   style={{
                     display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
                     borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
@@ -5627,7 +5669,7 @@ export default function SlotDataTracker() {
               <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
                   <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
-                    登録済みの日付（{overallSummaries.length}件）
+                    登録済みの日付（{new Set([...overallSummaries.map((s) => s.date), ...Object.keys(rawFullTable)]).size}件）
                   </div>
                   {overallSummaries.length > 0 && (
                     confirmDeleteAllOverall ? (
@@ -5650,15 +5692,23 @@ export default function SlotDataTracker() {
                 </div>
                 <div className="scrollbar" style={{ maxHeight: "180px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
                   {!overallSummariesLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
-                  {overallSummariesLoaded && overallSortedSummaries.length === 0 && (
+                  {overallSummariesLoaded && overallSortedSummaries.length === 0 && Object.keys(rawFullTable).length === 0 && (
                     <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
                   )}
-                  {[...overallSortedSummaries].reverse().map((s) => {
-                    const hasFullTable = !!rawFullTable[s.date];
-                    return (
+                  {(() => {
+                    const overallByDate = {};
+                    overallSortedSummaries.forEach((s) => { overallByDate[s.date] = s; });
+                    // v6.9.2: union of 民レポ dates AND アナスロ dates — previously
+                    // this list only ever showed 民レポ dates, so a date entered
+                    // in アナスロ first (before 民レポ) never appeared at all.
+                    const allDates = Array.from(new Set([...overallSortedSummaries.map((s) => s.date), ...Object.keys(rawFullTable)])).sort();
+                    return [...allDates].reverse().map((date) => {
+                      const s = overallByDate[date] || null;
+                      const hasFullTable = !!rawFullTable[date];
+                      return (
                     <div
-                      key={s.date}
-                      onClick={() => handleEditOverall(s)}
+                      key={date}
+                      onClick={() => (s ? handleEditOverall(s) : (setOverallDate(date), setOverallPasteText(""), setOverallStatus(null), loadFullTableForDate(date)))}
                       title="クリックでこの日のデータを編集"
                       style={{
                         display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
@@ -5666,8 +5716,8 @@ export default function SlotDataTracker() {
                         cursor: "pointer",
                       }}>
                       <div>
-                        <span className="mono">{s.date}</span>
-                        {s.event && (() => {
+                        <span className="mono">{date}</span>
+                        {s && s.event && (() => {
                           const names = splitEventNames(s.event);
                           const isStrong = names.some((n) => strongEventColorByName[n]);
                           const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
@@ -5694,24 +5744,30 @@ export default function SlotDataTracker() {
                             </span>
                           );
                         })()}
-                        <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>
-                        <span style={{ marginLeft: "6px", color: "#9ece6a" }}>民レポ〇</span>
+                        {s && <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>}
+                        <span style={{ marginLeft: "6px", color: s ? "#9ece6a" : "#e5697a" }}>
+                          民レポ{s ? "〇" : "未登録"}
+                        </span>
                         <span style={{ marginLeft: "6px", color: hasFullTable ? "#9ece6a" : "#e5697a" }}>
                           アナスロ{hasFullTable ? "〇" : "未登録"}
                         </span>
                       </div>
-                      {confirmDeleteOverall === s.date ? (
-                        <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
-                          <button onClick={() => handleDeleteOverall(s.date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
-                          <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
-                        </div>
-                      ) : (
-                        <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteOverall(s.date); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
-                          <Trash2 size={13} />
-                        </button>
-                      )}
+                      {s ? (
+                        confirmDeleteOverall === date ? (
+                          <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
+                            <button onClick={() => handleDeleteOverall(date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
+                            <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
+                          </div>
+                        ) : (
+                          <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteOverall(date); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                            <Trash2 size={13} />
+                          </button>
+                        )
+                      ) : null}
                     </div>
-                  );})}
+                      );
+                    });
+                  })()}
                 </div>
               </div>
             </div>
@@ -6329,6 +6385,18 @@ export default function SlotDataTracker() {
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
                           <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                             <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
+                            {(() => {
+                              const grade = symbolPointsToGrade(p.totalPoints);
+                              return grade ? (
+                                <span className="mono" style={{
+                                  fontSize: "13px", fontWeight: 800, width: "22px", height: "22px", lineHeight: "22px",
+                                  textAlign: "center", borderRadius: "50%", color: "#12161d",
+                                  background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#e5697a" }[grade],
+                                }}>
+                                  {grade}
+                                </span>
+                              ) : null;
+                            })()}
                             <span className="mono" style={{
                               fontSize: "11px", fontWeight: 700, color: "#12161d",
                               background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a",
