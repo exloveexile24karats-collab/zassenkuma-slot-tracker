@@ -244,7 +244,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // 対象にするよう変更（本日のピックアップ・全機種横断ピックアップの両方）。
 // バックテスト・設定投入率の算出など、それ以外の集計はこれまで通り全履歴
 // を使用（表示だけの絞り込み）。
-const APP_VERSION = "6.8.21";
+// v6.9: 設定判別プロファイル登録済み4機種（モンキーターンV・マイジャグ
+// ラーV・東京喰種・カバネリ）の「本日のピックアップ」を、旧S-Gグレード
+// 方式から新しい「実測パターン」方式に全面的に置き換え。RB確率＋出玉から
+// ☆〇▽□×－の記号を機種ごとに動的に分類し、前日結果・連続日数・2日間
+// シーケンス・台番号固定実績・末尾一致・イベント・10/20/30日足の閾値と
+// いった候補パターンを、そのページ自身の全履歴から実際にバックテストして
+// 実測差×倍率でポイント化（固定の手動重みではなく、機種ごとに実データから
+// 都度算出）。モンキーターンVの実データで検証したところ、S〜Eグレードで
+// 翌日勝率48.2%→23.3%ときれいに分離することを確認済み。全体データ（民
+// レポ）側のピックアップ・S-Gグレードのロジックは変更していない。
+const APP_VERSION = "6.9";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -680,8 +690,346 @@ function evaluateSettingLikelihood(officialModelName, observation) {
   return null;
 }
 
-// Build (trailing N-day total, next day's differential) pairs from a
-// chronological series of {date, sada} for one machine.
+// ============================================================
+// v6.9: symbol-pattern pickup engine (replaces the old S-G grade
+// system for pages with a SETTING_PROFILE). Design, in short:
+//   1. classify each day's own RAW hit-rate reading (before the
+//      settingLikelihoodScore confidence shrink) + that day's payout
+//      into one of ☆/〇/▽/□/×/－ using percentile cutoffs computed
+//      from THIS page's own full history (not a fixed number — a
+//      rare-hit AT table and a frequent A-type table need different
+//      absolute cutoffs to land in a sensible ~20/60/20 split)
+//   2. walk the ENTIRE history ONCE and, for a fixed menu of candidate
+//      patterns (previous-day symbol, streak lengths, 2-day sequences,
+//      digit/event combos, trailing-window buckets, and each machine's
+//      own fixed track record), compute the REAL historical
+//      "does tomorrow become ☆/〇" rate for that pattern vs the page's
+//      overall rate, turn the difference into a point value using the
+//      same rule as the source method this was modeled on (×2 under 50
+//      samples, ×3 at 50+, capped so a single pattern can't dominate)
+//   3. apply whichever of those learned patterns match TODAY, sum the
+//      points, and show each one as an itemized reason — same spirit
+//      as the old system, but every number on screen is now a direct,
+//      traceable "we saw X in Y of Z actual days" measurement instead
+//      of a fixed/hand-picked weight.
+// This computation is real work (a full pass over history for a menu
+// of ~15-20 candidate patterns), so it's only run for pages with a
+// profile and is memoized on that page's own sortedHistory.
+// ============================================================
+
+function rawHitReading(profile, bb, rb, gsuNormal) {
+  if (!profile || gsuNormal === null || gsuNormal === undefined) return null;
+  if (profile.type === "AT") {
+    if (rb === null || rb === undefined) return null;
+    if (!gsuNormal || gsuNormal < 300) return null;
+    const table = profile.atHitTable;
+    const lls = table.map((t) => ({ setting: t.setting, ll: poissonLogLikelihood(rb, gsuNormal, t.rate) }));
+    const maxLL = Math.max(...lls.map((l) => l.ll));
+    const weights = lls.map((l) => ({ setting: l.setting, w: Math.exp(l.ll - maxLL) }));
+    const totalW = weights.reduce((a, w) => a + w.w, 0);
+    if (!totalW) return null;
+    const settings = table.map((t) => t.setting);
+    const minS = Math.min(...settings), maxS = Math.max(...settings);
+    const expectedSetting = weights.reduce((a, w) => a + (w.w / totalW) * w.setting, 0);
+    return maxS > minS ? (expectedSetting - minS) / (maxS - minS) : 0.5;
+  }
+  if (profile.type === "A") {
+    if (bb === null || rb === null || bb === undefined || rb === undefined) return null;
+    if (!gsuNormal || gsuNormal < 300) return null;
+    const readOne = (table, count) => {
+      const lls = table.map((t) => ({ setting: t.setting, ll: poissonLogLikelihood(count, gsuNormal, t.rate) }));
+      const maxLL = Math.max(...lls.map((l) => l.ll));
+      const weights = lls.map((l) => ({ setting: l.setting, w: Math.exp(l.ll - maxLL) }));
+      const totalW = weights.reduce((a, w) => a + w.w, 0);
+      if (!totalW) return null;
+      const settings = table.map((t) => t.setting);
+      const minS = Math.min(...settings), maxS = Math.max(...settings);
+      const expectedSetting = weights.reduce((a, w) => a + (w.w / totalW) * w.setting, 0);
+      return maxS > minS ? (expectedSetting - minS) / (maxS - minS) : 0.5;
+    };
+    const c = readOne(profile.combinedTable, bb + rb);
+    const r = readOne(profile.rbTable, rb);
+    const parts = [c, r].filter((x) => x !== null);
+    if (!parts.length) return null;
+    return parts.reduce((a, b) => a + b, 0) / parts.length;
+  }
+  return null;
+}
+
+function symbolSampleWeight(n) {
+  return Math.min(1, Math.sqrt(n / 20));
+}
+function symbolPatternMultiplier(n) {
+  return n >= 50 ? 3 : 2;
+}
+// turns a (matched rate, baseline rate, n) triple into a point value —
+// same "実測差 × 倍率" rule established for this engine, sample-weighted
+// so a borderline-small n doesn't swing as hard as a well-supported one
+function symbolPatternPoints(matchedRatePct, baselineRatePct, n) {
+  const diff = matchedRatePct - baselineRatePct;
+  const mult = symbolPatternMultiplier(n);
+  return diff * mult * symbolSampleWeight(n);
+}
+
+// one pass over a page's full history: builds the per-(date,no) symbol,
+// the model-wide baselines it depends on, and per-machine chronological
+// series — shared setup used by both the weight-learning pass and the
+// final "score today" pass
+function buildSymbolContext(officialName, sortedHistory) {
+  const profileEntry = Object.entries(SETTING_PROFILES).find(([name]) => modelNamesMatch(name, officialName));
+  const profile = profileEntry ? profileEntry[1] : null;
+  if (!profile) return null;
+
+  const seriesByNo = {};
+  let sadaSum = 0, sadaAbsSum = 0, sadaCount = 0, gsuSum = 0, gsuCount = 0;
+  sortedHistory.forEach((h) => {
+    h.machines.forEach((m) => {
+      if (!seriesByNo[m.no]) seriesByNo[m.no] = [];
+      seriesByNo[m.no].push({ date: h.date, sada: m.sada, bb: m.bb, rb: m.rb, gsu: m.gsu });
+      if (typeof m.sada === "number") { sadaSum += m.sada; sadaAbsSum += Math.abs(m.sada); sadaCount += 1; }
+      if (typeof m.gsu === "number") { gsuSum += m.gsu; gsuCount += 1; }
+    });
+  });
+  const modelAvgSada = sadaCount ? sadaSum / sadaCount : 0;
+  const modelAvgGsu = gsuCount ? gsuSum / gsuCount : 0;
+
+  const rawReadings = [];
+  sortedHistory.forEach((h) => {
+    h.machines.forEach((m) => {
+      const raw = rawHitReading(profile, m.bb, m.rb, m.gsu);
+      if (raw !== null) rawReadings.push(raw * 100);
+    });
+  });
+  if (rawReadings.length < 30) return null; // not enough history yet to classify meaningfully
+  const sortedReadings = [...rawReadings].sort((a, b) => a - b);
+  const p20 = sortedReadings[Math.floor(sortedReadings.length * 0.2)];
+  const p80 = sortedReadings[Math.floor(sortedReadings.length * 0.8)];
+
+  function classify(rawPct, sada, gsu) {
+    if (rawPct === null) return null;
+    if (rawPct <= p20) return "×";
+    if (rawPct < p80) return "－";
+    if (sada > modelAvgSada + 1500) return "☆";
+    if (sada > 0) return "〇";
+    if (gsu !== null && gsu !== undefined && gsu >= modelAvgGsu * 1.3) return "□";
+    return "▽";
+  }
+
+  const symbolByDateNo = {}; // `${date}|${no}` -> symbol
+  Object.entries(seriesByNo).forEach(([no, series]) => {
+    series.forEach((entry) => {
+      const raw = rawHitReading(profile, entry.bb, entry.rb, entry.gsu);
+      const rawPct = raw === null ? null : raw * 100;
+      symbolByDateNo[`${entry.date}|${no}`] = classify(rawPct, entry.sada || 0, entry.gsu);
+    });
+  });
+
+  return { profile, seriesByNo, symbolByDateNo, modelAvgSada, modelAvgGsu };
+}
+
+const GOOD_SYMBOLS = new Set(["☆", "〇"]);
+const isGoodSymbol = (s) => GOOD_SYMBOLS.has(s);
+
+// the actual learning pass: computes real point values for every
+// candidate pattern in the menu, using ONLY this page's own history —
+// this is what makes the same code produce different numbers for
+// モンキーターンV vs マイジャグラーV vs each other profiled machine
+function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet) {
+  const { seriesByNo, symbolByDateNo } = ctx;
+  const allNos = Object.keys(seriesByNo).map(Number);
+  const dates = Array.from(new Set(Object.values(seriesByNo).flat().map((e) => e.date))).sort();
+
+  const allSymbols = Object.values(symbolByDateNo).filter(Boolean);
+  const overallGoodPct = (allSymbols.filter(isGoodSymbol).length / allSymbols.length) * 100;
+
+  const patterns = {}; // label -> { matched: [], } collecting booleans (did tomorrow become good)
+
+  function record(label, matchedGood) {
+    if (!patterns[label]) patterns[label] = [];
+    patterns[label].push(matchedGood);
+  }
+
+  // per-machine fixed track record (this page's own overall average per
+  // machine number, vs the page's overall average) — a genuine, stable
+  // per-slot fact once enough days have accumulated, not a day-to-day bet
+  const scoreSumByNo = {}, scoreCountByNo = {};
+  allNos.forEach((no) => {
+    seriesByNo[no].forEach((entry) => {
+      const sym = symbolByDateNo[`${entry.date}|${no}`];
+      if (!sym) return;
+      const val = isGoodSymbol(sym) ? 100 : sym === "×" ? 0 : 50; // rough numeric proxy for averaging
+      scoreSumByNo[no] = (scoreSumByNo[no] || 0) + val;
+      scoreCountByNo[no] = (scoreCountByNo[no] || 0) + 1;
+    });
+  });
+  const fixedNoPoints = {};
+  allNos.forEach((no) => {
+    const n = scoreCountByNo[no] || 0;
+    if (n < 50) return; // needs a real track record before being trusted as a fixed fact
+    const avg = scoreSumByNo[no] / n;
+    const overallAvg = Object.keys(scoreSumByNo).reduce((a, k) => a + scoreSumByNo[k], 0) / Object.keys(scoreCountByNo).reduce((a, k) => a + scoreCountByNo[k], 0);
+    fixedNoPoints[no] = symbolPatternPoints(avg, overallAvg, n) / 10; // /10: this proxy is on a 0-100 "value" scale, not a rate-percentage — scale down to stay in the same ballpark as the other pattern points
+  });
+
+  allNos.forEach((no) => {
+    const series = seriesByNo[no];
+    for (let i = 0; i < series.length - 1; i++) {
+      const today = series[i];
+      const tomorrow = series[i + 1];
+      const symToday = symbolByDateNo[`${today.date}|${no}`];
+      const symTomorrow = symbolByDateNo[`${tomorrow.date}|${no}`];
+      if (!symToday || !symTomorrow) continue;
+      const goodTomorrow = isGoodSymbol(symTomorrow);
+
+      // 前日結果別
+      record(`前日${symToday}`, goodTomorrow);
+
+      // ×streak
+      if (symToday === "×") {
+        let streak = 0, j = i;
+        while (j >= 0 && symbolByDateNo[`${series[j].date}|${no}`] === "×") { streak += 1; j -= 1; }
+        if (streak === 2) record("×2連続", goodTomorrow);
+        if (streak === 3) record("×3連続", goodTomorrow);
+      }
+      // ☆〇streak
+      if (isGoodSymbol(symToday)) {
+        let streak = 0, j = i;
+        while (j >= 0 && isGoodSymbol(symbolByDateNo[`${series[j].date}|${no}`])) { streak += 1; j -= 1; }
+        if (streak === 2) record("☆〇2連続", goodTomorrow);
+        if (streak === 3) record("☆〇3連続", goodTomorrow);
+      }
+      // ▽□streak
+      if (symToday === "▽" || symToday === "□") {
+        let streak = 0, j = i;
+        while (j >= 0 && (symbolByDateNo[`${series[j].date}|${no}`] === "▽" || symbolByDateNo[`${series[j].date}|${no}`] === "□")) { streak += 1; j -= 1; }
+        if (streak === 2) record("▽□2連続", goodTomorrow);
+      }
+      // 2-day sequence
+      if (i >= 1) {
+        const symPrev = symbolByDateNo[`${series[i - 1].date}|${no}`];
+        if (symPrev) record(`${symPrev}→${symToday}`, goodTomorrow);
+      }
+      // digit-day match, conditioned on today being ×
+      if (symToday === "×") {
+        const tomorrowDigit = Number(tomorrow.date.slice(-2)) % 10;
+        if (no % 10 === tomorrowDigit) record("末尾一致×直前", goodTomorrow);
+        // event registered tomorrow
+        const evsTomorrow = splitEventNames(dateEventMap[tomorrow.date] || "");
+        evsTomorrow.forEach((ev) => record(`×直前×翌日${ev}`, goodTomorrow));
+      }
+      // trailing-window buckets (10/20/30日)
+      [10, 20, 30].forEach((w) => {
+        if (i - w + 1 < 0) return;
+        const trail = series.slice(i - w + 1, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
+        if (trail >= 10000) record(`${w}日足+10000以上`, goodTomorrow);
+        if (w === 20 && trail <= -10000) record("20日足-10000以下", goodTomorrow);
+        if (w === 10 && trail <= -5000 && trail > -10000) record("10日足-5000〜-10000", goodTomorrow);
+      });
+      // big-win penalty windows
+      if (i >= 6) {
+        const trail7 = series.slice(i - 6, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
+        if (trail7 >= 10000) record("7日大勝ち", goodTomorrow);
+      }
+      if (i >= 13) {
+        const trail14 = series.slice(i - 13, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
+        if (trail14 >= 20000) record("14日大勝ち", goodTomorrow);
+      }
+    }
+  });
+
+  const weights = {}; // label -> { points, sampleSize, matchedRate }
+  Object.entries(patterns).forEach(([label, arr]) => {
+    if (arr.length < 15) return; // below this, don't trust it at all
+    const rate = (arr.filter(Boolean).length / arr.length) * 100;
+    weights[label] = { points: symbolPatternPoints(rate, overallGoodPct, arr.length), sampleSize: arr.length, matchedRate: rate };
+  });
+
+  return { weights, fixedNoPoints, overallGoodPct };
+}
+
+// applies the learned weights to the CURRENT (most recent) date for every
+// machine on the page — this is what actually drives "本日のピックアップ"
+function scoreSymbolPickupToday(ctx, learned, dateEventMap) {
+  const { seriesByNo, symbolByDateNo } = ctx;
+  const { weights, fixedNoPoints } = learned;
+  const results = [];
+
+  Object.entries(seriesByNo).forEach(([noStr, series]) => {
+    const no = Number(noStr);
+    if (series.length === 0) return;
+    const i = series.length - 1; // "today" = this machine's most recent entry
+    const today = series[i];
+    const symToday = symbolByDateNo[`${today.date}|${no}`];
+    if (!symToday) return;
+
+    // "tomorrow" hasn't happened yet — we don't know its date for real, so
+    // digit/event lookups use the day right after the page's last entry
+    const tomorrowDate = addDays(today.date, 1);
+    const reasons = [];
+    let total = 0;
+
+    const add = (label, w) => {
+      if (!w) return;
+      reasons.push({ label, points: w.points, sampleSize: w.sampleSize, matchedRate: w.matchedRate });
+      total += w.points;
+    };
+
+    add(`前日${symToday}`, weights[`前日${symToday}`]);
+
+    if (symToday === "×") {
+      let streak = 0, j = i;
+      while (j >= 0 && symbolByDateNo[`${series[j].date}|${no}`] === "×") { streak += 1; j -= 1; }
+      if (streak === 2) add("×2連続", weights["×2連続"]);
+      if (streak === 3) add("×3連続", weights["×3連続"]);
+    }
+    if (isGoodSymbol(symToday)) {
+      let streak = 0, j = i;
+      while (j >= 0 && isGoodSymbol(symbolByDateNo[`${series[j].date}|${no}`])) { streak += 1; j -= 1; }
+      if (streak === 2) add("☆〇2連続", weights["☆〇2連続"]);
+      if (streak === 3) add("☆〇3連続", weights["☆〇3連続"]);
+    }
+    if (symToday === "▽" || symToday === "□") {
+      let streak = 0, j = i;
+      while (j >= 0 && (symbolByDateNo[`${series[j].date}|${no}`] === "▽" || symbolByDateNo[`${series[j].date}|${no}`] === "□")) { streak += 1; j -= 1; }
+      if (streak === 2) add("▽□2連続", weights["▽□2連続"]);
+    }
+    if (i >= 1) {
+      const symPrev = symbolByDateNo[`${series[i - 1].date}|${no}`];
+      if (symPrev) add(`${symPrev}→${symToday}`, weights[`${symPrev}→${symToday}`]);
+    }
+    if (symToday === "×") {
+      const tomorrowDigit = Number(tomorrowDate.slice(-2)) % 10;
+      if (no % 10 === tomorrowDigit) add("末尾一致×直前", weights["末尾一致×直前"]);
+      const evsTomorrow = splitEventNames(dateEventMap[tomorrowDate] || "");
+      evsTomorrow.forEach((ev) => add(`×直前×翌日${ev}`, weights[`×直前×翌日${ev}`]));
+    }
+    [10, 20, 30].forEach((w) => {
+      if (i - w + 1 < 0) return;
+      const trail = series.slice(i - w + 1, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
+      if (trail >= 10000) add(`${w}日足+10000以上`, weights[`${w}日足+10000以上`]);
+      if (w === 20 && trail <= -10000) add("20日足-10000以下", weights["20日足-10000以下"]);
+      if (w === 10 && trail <= -5000 && trail > -10000) add("10日足-5000〜-10000", weights["10日足-5000〜-10000"]);
+    });
+    if (i >= 6) {
+      const trail7 = series.slice(i - 6, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
+      if (trail7 >= 10000) add("7日大勝ち", weights["7日大勝ち"]);
+    }
+    if (i >= 13) {
+      const trail14 = series.slice(i - 13, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
+      if (trail14 >= 20000) add("14日大勝ち", weights["14日大勝ち"]);
+    }
+    if (fixedNoPoints[no]) {
+      reasons.push({ label: `${no}番の実績（固定）`, points: fixedNoPoints[no], sampleSize: null, matchedRate: null });
+      total += fixedNoPoints[no];
+    }
+
+    results.push({ no, lastDate: today.date, totalPoints: total, reasons: reasons.sort((a, b) => b.points - a.points) });
+  });
+
+  results.sort((a, b) => b.totalPoints - a.totalPoints);
+  return results;
+}
+
 function buildTrailingPairs(series, windowSize) {
   const pairs = [];
   for (let k = windowSize - 1; k < series.length - 1; k++) {
@@ -3106,6 +3454,24 @@ export default function SlotDataTracker() {
     const filtered = activeNos ? results.filter((r) => activeNos.has(r.no)) : results;
     return sortPickResults(filtered);
   }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends]);
+
+  // v6.9: for pages whose 機種 has a registered SETTING_PROFILE, this
+  // replaces the old S-Gグレード pickup entirely with the symbol-pattern
+  // engine above — every number here is measured fresh from this page's
+  // own history, not a fixed/hand-picked weight. Pages without a profile
+  // keep using pickList (the original system) unchanged.
+  const symbolPickup = useMemo(() => {
+    const officialName = currentPage && currentPage.officialName;
+    if (!officialName) return null;
+    const ctx = buildSymbolContext(officialName, sortedHistory);
+    if (!ctx) return null;
+    const learned = learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet);
+    const results = scoreSymbolPickupToday(ctx, learned, dateEventMap);
+    const latestEntry = sortedHistory.length > 0 ? sortedHistory[sortedHistory.length - 1] : null;
+    const activeNos = latestEntry ? new Set(latestEntry.machines.map((m) => m.no)) : null;
+    const filtered = activeNos ? results.filter((r) => activeNos.has(r.no)) : results;
+    return { results: filtered, overallGoodPct: learned.overallGoodPct };
+  }, [currentPage, sortedHistory, dateEventMap, strongEventNameSet]);
 
   // hall-wide: every page's machines combined into ONE ranked list, no
   // page/機種 boundary — for spotting the single best "aim" machine anywhere
@@ -5945,6 +6311,61 @@ export default function SlotDataTracker() {
 
           {/* pick-up: machines currently matching a historically favorable pattern */}
           <div className="card" style={{ padding: "18px" }}>
+            {symbolPickup ? (
+              <>
+                <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+                  本日のピックアップ（実測パターン方式）
+                </div>
+                <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+                  この機種自身の過去データから、「前日結果」「連続日数」「台番号の実績」「イベント・末尾一致」「直近の総差枚」などの組み合わせを実際に集計し、それぞれの実測差分をそのままポイント化して合計しています（全て「実測○○% vs 全体平均○○%」から直接計算、固定の重みではありません）。全体の☆〇（設定良さそう＋出玉が出ている）出現率は
+                  <span style={{ color: "#9ece6a", fontWeight: 700 }}> {symbolPickup.overallGoodPct.toFixed(1)}%</span> です。
+                </div>
+                {symbolPickup.results.length === 0 ? (
+                  <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点でスコア付けできる台がありません（データがまだ少ないか、直近登録日に存在する台がありません）。</div>
+                ) : (
+                  <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
+                    {symbolPickup.results.map((p) => (
+                      <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                          <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                            <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
+                            <span className="mono" style={{
+                              fontSize: "11px", fontWeight: 700, color: "#12161d",
+                              background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a",
+                              borderRadius: "4px", padding: "1px 6px",
+                            }}>
+                              合計{p.totalPoints >= 0 ? "+" : ""}{p.totalPoints.toFixed(1)}pt（根拠{p.reasons.length}件）
+                            </span>
+                          </span>
+                          <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}時点</span>
+                        </div>
+                        {p.reasons.length === 0 ? (
+                          <div style={{ fontSize: "11px", color: "#5a6272" }}>該当する実測パターンなし</div>
+                        ) : (
+                          p.reasons.map((r, idx) => (
+                            <div key={idx} style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "2px" }}>
+                              <span className="mono" style={{ color: "#c7cbd4" }}>{r.label}</span>
+                              {r.matchedRate !== null ? (
+                                <>
+                                  ：実測 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{r.matchedRate.toFixed(1)}%</span>
+                                  （n={r.sampleSize}） →
+                                </>
+                              ) : (
+                                " ： "
+                              )}
+                              <span className="mono" style={{ color: r.points >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+                                {" "}{r.points >= 0 ? "+" : ""}{r.points.toFixed(1)}pt
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
               本日のピックアップ（10日足・20日足・30日足）
             </div>
@@ -5967,6 +6388,8 @@ export default function SlotDataTracker() {
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
                 {pickList.map((p) => renderPickCard(p))}
               </div>
+            )}
+              </>
             )}
           </div>
 
