@@ -273,7 +273,13 @@ const DIGIT7_COLOR = "#f6a04d";
 // 「今日がそのイベント/日付末尾なら全台に効く」版を追加し忘れていた）。
 // 単独版のパターンを追加：日付末尾（条件なし）、イベント名当日（条件な
 // し、末尾一致判定も含む）、強いイベント当日、自己平均比ローテーション。
-const APP_VERSION = "6.9.3";
+// v6.9.4: さらに見落としがあった、凹み上げ・強いイベント翌日（イベント
+// 当日とは別物、イベントの"翌日"効果）・準イベント翌日・台番号末尾単独
+// ×直前（イベントの数字と無関係）・N日前サイクル（4〜7日前）・曜日傾向
+// を追加。あわせて、直前の修正で「強いイベント当日」が条件を満たさなくて
+// も常に加算されてしまっていたバグと、strongEventNameSetがスコープ外で
+// 参照されクラッシュしていたバグも修正。
+const APP_VERSION = "6.9.4";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -853,7 +859,7 @@ const isGoodSymbol = (s) => GOOD_SYMBOLS.has(s);
 // candidate pattern in the menu, using ONLY this page's own history —
 // this is what makes the same code produce different numbers for
 // モンキーターンV vs マイジャグラーV vs each other profiled machine
-function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet) {
+function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet, semiEventNameSet) {
   const { seriesByNo, symbolByDateNo } = ctx;
   const allNos = Object.keys(seriesByNo).map(Number);
   const dates = Array.from(new Set(Object.values(seriesByNo).flat().map((e) => e.date))).sort();
@@ -980,6 +986,37 @@ function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet) {
         const trail14 = series.slice(i - 13, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
         if (trail14 >= 20000) record("14日大勝ち", goodTomorrow);
       }
+      // v6.9.4: more previously-missing patterns —
+      // 凹み上げ: today negative AND tomorrow is a strong event day
+      if (today.sada !== null && today.sada !== undefined && today.sada < 0 && isStrongTomorrow) {
+        record("凹み上げ", goodTomorrow);
+      }
+      // 強い/準イベント翌日: the day AFTER a strong/semi event (different from
+      // "イベント当日" above, which is the event day itself)
+      if (i >= 1) {
+        const evsToday = splitEventNames(dateEventMap[today.date] || "");
+        const wasStrongToday = evsToday.some((ev) => strongEventNameSet.has(ev));
+        if (wasStrongToday) record("強いイベント翌日", goodTomorrow);
+        const wasSemiToday = !wasStrongToday && evsToday.some((ev) => semiEventNameSet.has(ev));
+        if (wasSemiToday) record("準イベント翌日", goodTomorrow);
+      }
+      // 台番号末尾（単独、イベントの数字と無関係）× ×直前 — this is different
+      // from 末尾一致×直前 above (that one required matching an event's own
+      // digit; this is just "this machine's own ending digit" on its own)
+      if (symToday === "×") {
+        record(`末尾${no % 10}×直前`, goodTomorrow);
+      }
+      // N日前サイクル: was ×直前 today, and was ☆/〇 exactly N days ago
+      if (symToday === "×") {
+        [4, 5, 6, 7].forEach((N) => {
+          if (i - N < 0) return;
+          const symNAgo = symbolByDateNo[`${series[i - N].date}|${no}`];
+          if (symNAgo && isGoodSymbol(symNAgo)) record(`×直前×${N}日前☆〇`, goodTomorrow);
+        });
+      }
+      // 曜日傾向: which weekday tomorrow is
+      const tomorrowWd = new Date(tomorrow.date + "T00:00:00").getDay();
+      record(`曜日=${["日", "月", "火", "水", "木", "金", "土"][tomorrowWd]}`, goodTomorrow);
     }
   });
 
@@ -995,7 +1032,7 @@ function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet) {
 
 // applies the learned weights to the CURRENT (most recent) date for every
 // machine on the page — this is what actually drives "本日のピックアップ"
-function scoreSymbolPickupToday(ctx, learned, dateEventMap) {
+function scoreSymbolPickupToday(ctx, learned, dateEventMap, strongEventNameSet, semiEventNameSet) {
   const { seriesByNo, symbolByDateNo } = ctx;
   const { weights, fixedNoPoints } = learned;
   const results = [];
@@ -1060,7 +1097,8 @@ function scoreSymbolPickupToday(ctx, learned, dateEventMap) {
       const evDigitMatch = ev.match(/([0-9])のつく日/);
       if (evDigitMatch && no % 10 === Number(evDigitMatch[1])) add("イベント名×台番号末尾一致", weights["イベント名×台番号末尾一致"]);
     });
-    add("強いイベント当日", weights["強いイベント当日"]);
+    const isStrongTomorrow = evsTomorrowAlways.some((ev) => strongEventNameSet.has(ev));
+    if (isStrongTomorrow) add("強いイベント当日", weights["強いイベント当日"]);
     if (i >= 20) {
       const recent = series.slice(Math.max(0, i - 6), i + 1);
       const baseline = series.slice(0, i + 1);
@@ -1084,6 +1122,27 @@ function scoreSymbolPickupToday(ctx, learned, dateEventMap) {
       const trail14 = series.slice(i - 13, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
       if (trail14 >= 20000) add("14日大勝ち", weights["14日大勝ち"]);
     }
+    // v6.9.4: previously-missing patterns, mirrored from the learning pass
+    if (today.sada !== null && today.sada !== undefined && today.sada < 0 && isStrongTomorrow) {
+      add("凹み上げ", weights["凹み上げ"]);
+    }
+    if (i >= 1) {
+      const evsToday = splitEventNames(dateEventMap[today.date] || "");
+      const wasStrongToday = evsToday.some((ev) => strongEventNameSet.has(ev));
+      if (wasStrongToday) add("強いイベント翌日", weights["強いイベント翌日"]);
+      const wasSemiToday = !wasStrongToday && evsToday.some((ev) => semiEventNameSet.has(ev));
+      if (wasSemiToday) add("準イベント翌日", weights["準イベント翌日"]);
+    }
+    if (symToday === "×") {
+      add(`末尾${no % 10}×直前`, weights[`末尾${no % 10}×直前`]);
+      [4, 5, 6, 7].forEach((N) => {
+        if (i - N < 0) return;
+        const symNAgo = symbolByDateNo[`${series[i - N].date}|${no}`];
+        if (symNAgo && isGoodSymbol(symNAgo)) add(`×直前×${N}日前☆〇`, weights[`×直前×${N}日前☆〇`]);
+      });
+    }
+    const tomorrowWd = new Date(tomorrowDate + "T00:00:00").getDay();
+    add(`曜日=${["日", "月", "火", "水", "木", "金", "土"][tomorrowWd]}`, weights[`曜日=${["日", "月", "火", "水", "木", "金", "土"][tomorrowWd]}`]);
     if (fixedNoPoints[no]) {
       reasons.push({ label: `${no}番の実績（固定）`, points: fixedNoPoints[no], sampleSize: null, matchedRate: null });
       total += fixedNoPoints[no];
@@ -3549,13 +3608,13 @@ export default function SlotDataTracker() {
     if (!officialName) return null;
     const ctx = buildSymbolContext(officialName, sortedHistory);
     if (!ctx) return null;
-    const learned = learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet);
-    const results = scoreSymbolPickupToday(ctx, learned, dateEventMap);
+    const learned = learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet, semiEventNameSet);
+    const results = scoreSymbolPickupToday(ctx, learned, dateEventMap, strongEventNameSet, semiEventNameSet);
     const latestEntry = sortedHistory.length > 0 ? sortedHistory[sortedHistory.length - 1] : null;
     const activeNos = latestEntry ? new Set(latestEntry.machines.map((m) => m.no)) : null;
     const filtered = activeNos ? results.filter((r) => activeNos.has(r.no)) : results;
     return { results: filtered, overallGoodPct: learned.overallGoodPct };
-  }, [currentPage, sortedHistory, dateEventMap, strongEventNameSet]);
+  }, [currentPage, sortedHistory, dateEventMap, strongEventNameSet, semiEventNameSet]);
 
   // hall-wide: every page's machines combined into ONE ranked list, no
   // page/機種 boundary — for spotting the single best "aim" machine anywhere
