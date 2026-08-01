@@ -266,7 +266,14 @@ const DIGIT7_COLOR = "#f6a04d";
 // 一切出てこなかった問題を修正。民レポ・アナスロ両方の日付の和集合で一覧
 // を作るように変更し、片方しか無い日付でも「民レポ未登録／アナスロ〇」
 // のように正しく表示されるようにした。
-const APP_VERSION = "6.9.2";
+// v6.9.3: v6.9の実測パターンエンジンに、分析時に見つけた一番大きい単独の
+// 基準（でちゃう🌈当日・日付末尾=9・イベント名×台番号末尾一致・自己平均
+// 比ローテーション・新台入れ替え当日等）が実装から丸ごと抜けていた
+// （「×直前と組み合わさった時」の条件付き版しか実装しておらず、単独の
+// 「今日がそのイベント/日付末尾なら全台に効く」版を追加し忘れていた）。
+// 単独版のパターンを追加：日付末尾（条件なし）、イベント名当日（条件な
+// し、末尾一致判定も含む）、強いイベント当日、自己平均比ローテーション。
+const APP_VERSION = "6.9.3";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -929,6 +936,33 @@ function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet) {
         const evsTomorrow = splitEventNames(dateEventMap[tomorrow.date] || "");
         evsTomorrow.forEach((ev) => record(`×直前×翌日${ev}`, goodTomorrow));
       }
+      // v6.9.3: the following are UNCONDITIONED versions of the above — these
+      // were the biggest single findings during analysis (でちゃう🌈 当日,
+      // 日付末尾=9, イベント名×末尾一致 etc.) but were missing from the
+      // engine entirely, since only the "×直前と組み合わさった時" conditioned
+      // variants had been wired in. A plain "tomorrow is date-digit N" or
+      // "tomorrow has event X registered" effect applies to EVERY machine
+      // on that day, regardless of what state that specific machine was in.
+      const tomorrowDigitAlways = Number(tomorrow.date.slice(-2)) % 10;
+      record(`日付末尾=${tomorrowDigitAlways}`, goodTomorrow);
+      const evsTomorrowAlways = splitEventNames(dateEventMap[tomorrow.date] || "");
+      evsTomorrowAlways.forEach((ev) => {
+        record(`イベント当日=${ev}`, goodTomorrow);
+        const evDigitMatch = ev.match(/([0-9])のつく日/);
+        if (evDigitMatch && no % 10 === Number(evDigitMatch[1])) record("イベント名×台番号末尾一致", goodTomorrow);
+      });
+      const isStrongTomorrow = evsTomorrowAlways.some((ev) => strongEventNameSet.has(ev));
+      if (isStrongTomorrow) record("強いイベント当日", goodTomorrow);
+      // 自己平均比ローテーション（好調）— this machine's own trailing 7-day
+      // average vs its own longer-run average, independent of any symbol state
+      if (i >= 20) {
+        const recent = series.slice(Math.max(0, i - 6), i + 1);
+        const baseline = series.slice(0, i + 1);
+        const recentAvg = recent.reduce((a, e) => a + (e.sada || 0), 0) / recent.length;
+        const baseAvg = baseline.reduce((a, e) => a + (e.sada || 0), 0) / baseline.length;
+        const typicalMag = baseline.reduce((a, e) => a + Math.abs(e.sada || 0), 0) / baseline.length || 1;
+        if ((recentAvg - baseAvg) / typicalMag > 0.3) record("自己平均比ローテーション（好調）", goodTomorrow);
+      }
       // trailing-window buckets (10/20/30日)
       [10, 20, 30].forEach((w) => {
         if (i - w + 1 < 0) return;
@@ -1014,6 +1048,26 @@ function scoreSymbolPickupToday(ctx, learned, dateEventMap) {
       if (no % 10 === tomorrowDigit) add("末尾一致×直前", weights["末尾一致×直前"]);
       const evsTomorrow = splitEventNames(dateEventMap[tomorrowDate] || "");
       evsTomorrow.forEach((ev) => add(`×直前×翌日${ev}`, weights[`×直前×翌日${ev}`]));
+    }
+    // v6.9.3: unconditioned versions — apply to every machine regardless of
+    // today's own symbol, matching how these were originally found (でちゃう
+    // 🌈当日, 日付末尾=9, イベント名×台番号末尾一致, 自己平均比ローテーション)
+    const tomorrowDigitAlways = Number(tomorrowDate.slice(-2)) % 10;
+    add(`日付末尾=${tomorrowDigitAlways}`, weights[`日付末尾=${tomorrowDigitAlways}`]);
+    const evsTomorrowAlways = splitEventNames(dateEventMap[tomorrowDate] || "");
+    evsTomorrowAlways.forEach((ev) => {
+      add(`イベント当日=${ev}`, weights[`イベント当日=${ev}`]);
+      const evDigitMatch = ev.match(/([0-9])のつく日/);
+      if (evDigitMatch && no % 10 === Number(evDigitMatch[1])) add("イベント名×台番号末尾一致", weights["イベント名×台番号末尾一致"]);
+    });
+    add("強いイベント当日", weights["強いイベント当日"]);
+    if (i >= 20) {
+      const recent = series.slice(Math.max(0, i - 6), i + 1);
+      const baseline = series.slice(0, i + 1);
+      const recentAvg = recent.reduce((a, e) => a + (e.sada || 0), 0) / recent.length;
+      const baseAvg = baseline.reduce((a, e) => a + (e.sada || 0), 0) / baseline.length;
+      const typicalMag = baseline.reduce((a, e) => a + Math.abs(e.sada || 0), 0) / baseline.length || 1;
+      if ((recentAvg - baseAvg) / typicalMag > 0.3) add("自己平均比ローテーション（好調）", weights["自己平均比ローテーション（好調）"]);
     }
     [10, 20, 30].forEach((w) => {
       if (i - w + 1 < 0) return;
