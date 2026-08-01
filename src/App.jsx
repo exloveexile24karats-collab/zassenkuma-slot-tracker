@@ -279,7 +279,16 @@ const DIGIT7_COLOR = "#f6a04d";
 // を追加。あわせて、直前の修正で「強いイベント当日」が条件を満たさなくて
 // も常に加算されてしまっていたバグと、strongEventNameSetがスコープ外で
 // 参照されクラッシュしていたバグも修正。
-const APP_VERSION = "6.9.4";
+// v6.9.5: 表と実装を1行ずつ突き合わせ、「7日大勝ち×1連続のみ」の"×1連続
+// のみ"という条件が実装から抜けていた（単に「7日大勝ち」とだけ判定して
+// いた）のを修正。「月に☆〇→翌日」（多重比較の疑いで元々注意フラグ付き）
+// と、台ごとの持続性/反持続性（n=13〜28件のみで低信頼と判断したもの）は
+// 引き続き意図的に未実装。
+// v6.9.6: 上記の残り2つも追加。「月に☆〇→翌日」（月曜日に☆〇だった台は
+// 翌日も、という組み合わせ、多重比較の疑いは注意コメントとして残した）と
+// 「台ごとの持続性/反持続性」（機種全体でまとめず台番号ごとに個別集計、
+// ⚠️低信頼のラベル付きで表示、上下限±15ptに制限）。
+const APP_VERSION = "6.9.6";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -896,6 +905,31 @@ function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet, semiEv
     fixedNoPoints[no] = symbolPatternPoints(avg, overallAvg, n) / 10; // /10: this proxy is on a 0-100 "value" scale, not a rate-percentage — scale down to stay in the same ballpark as the other pattern points
   });
 
+  // v6.9.6 ④: per-machine persistence / anti-persistence ("today ☆〇 →
+  // tomorrow ☆〇 rate", computed separately for EACH machine number instead
+  // of pooled across all of them). Flagged during analysis as low-confidence
+  // (each machine only gets 13-28 samples, and testing ~40 machines
+  // independently means a few will look big purely by chance) — kept at a
+  // lower cap and a stricter minimum sample size than the other patterns to
+  // reflect that lower confidence, per the person's explicit request to
+  // include it anyway rather than drop it.
+  const perNoPersistencePoints = {};
+  allNos.forEach((no) => {
+    const series = seriesByNo[no];
+    const highNext = [], otherNext = [];
+    for (let i = 0; i < series.length - 1; i++) {
+      const symToday = symbolByDateNo[`${series[i].date}|${no}`];
+      const symTomorrow = symbolByDateNo[`${series[i + 1].date}|${no}`];
+      if (!symToday || !symTomorrow) continue;
+      (isGoodSymbol(symToday) ? highNext : otherNext).push(isGoodSymbol(symTomorrow));
+    }
+    if (highNext.length < 12 || otherNext.length < 10) return; // below this, not even worth a low-confidence flag
+    const highRate = (highNext.filter(Boolean).length / highNext.length) * 100;
+    const otherRate = (otherNext.filter(Boolean).length / otherNext.length) * 100;
+    const raw = symbolPatternPoints(highRate, otherRate, highNext.length);
+    perNoPersistencePoints[no] = { points: Math.max(-15, Math.min(15, raw)), sampleSize: highNext.length, matchedRate: highRate };
+  });
+
   allNos.forEach((no) => {
     const series = seriesByNo[no];
     for (let i = 0; i < series.length - 1; i++) {
@@ -977,10 +1011,15 @@ function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet, semiEv
         if (w === 20 && trail <= -10000) record("20日足-10000以下", goodTomorrow);
         if (w === 10 && trail <= -5000 && trail > -10000) record("10日足-5000〜-10000", goodTomorrow);
       });
-      // big-win penalty windows
+      // big-win penalty windows — v6.9.5: restored the "×1連続のみ" condition
+      // that had been dropped (this was originally found specifically for
+      // "big trailing win AND only just started a 1-day losing streak", not
+      // for a big trailing win alone)
       if (i >= 6) {
         const trail7 = series.slice(i - 6, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
-        if (trail7 >= 10000) record("7日大勝ち", goodTomorrow);
+        let lossStreak = 0, j = i;
+        while (j >= 0 && series[j].sada !== null && series[j].sada !== undefined && series[j].sada < 0) { lossStreak += 1; j -= 1; }
+        if (trail7 >= 10000 && lossStreak === 1) record("7日大勝ち×1連続のみ", goodTomorrow);
       }
       if (i >= 13) {
         const trail14 = series.slice(i - 13, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
@@ -1017,6 +1056,12 @@ function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet, semiEv
       // 曜日傾向: which weekday tomorrow is
       const tomorrowWd = new Date(tomorrow.date + "T00:00:00").getDay();
       record(`曜日=${["日", "月", "火", "水", "木", "金", "土"][tomorrowWd]}`, goodTomorrow);
+      // 月に☆〇→翌日: today is Monday AND today is ☆/〇 — v6.9.6, flagged
+      // during analysis as possible multiple-comparison noise (only one of
+      // 7 weekdays tested came back large), included now on request but
+      // kept as its own labeled pattern so it's easy to spot/remove later
+      const todayWd = new Date(today.date + "T00:00:00").getDay();
+      if (todayWd === 1 && isGoodSymbol(symToday)) record("月に☆〇→翌日", goodTomorrow);
     }
   });
 
@@ -1027,14 +1072,14 @@ function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet, semiEv
     weights[label] = { points: symbolPatternPoints(rate, overallGoodPct, arr.length), sampleSize: arr.length, matchedRate: rate };
   });
 
-  return { weights, fixedNoPoints, overallGoodPct };
+  return { weights, fixedNoPoints, perNoPersistencePoints, overallGoodPct };
 }
 
 // applies the learned weights to the CURRENT (most recent) date for every
 // machine on the page — this is what actually drives "本日のピックアップ"
 function scoreSymbolPickupToday(ctx, learned, dateEventMap, strongEventNameSet, semiEventNameSet) {
   const { seriesByNo, symbolByDateNo } = ctx;
-  const { weights, fixedNoPoints } = learned;
+  const { weights, fixedNoPoints, perNoPersistencePoints } = learned;
   const results = [];
 
   Object.entries(seriesByNo).forEach(([noStr, series]) => {
@@ -1116,7 +1161,9 @@ function scoreSymbolPickupToday(ctx, learned, dateEventMap, strongEventNameSet, 
     });
     if (i >= 6) {
       const trail7 = series.slice(i - 6, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
-      if (trail7 >= 10000) add("7日大勝ち", weights["7日大勝ち"]);
+      let lossStreak = 0, j = i;
+      while (j >= 0 && series[j].sada !== null && series[j].sada !== undefined && series[j].sada < 0) { lossStreak += 1; j -= 1; }
+      if (trail7 >= 10000 && lossStreak === 1) add("7日大勝ち×1連続のみ", weights["7日大勝ち×1連続のみ"]);
     }
     if (i >= 13) {
       const trail14 = series.slice(i - 13, i + 1).reduce((a, e) => a + (e.sada || 0), 0);
@@ -1143,9 +1190,17 @@ function scoreSymbolPickupToday(ctx, learned, dateEventMap, strongEventNameSet, 
     }
     const tomorrowWd = new Date(tomorrowDate + "T00:00:00").getDay();
     add(`曜日=${["日", "月", "火", "水", "木", "金", "土"][tomorrowWd]}`, weights[`曜日=${["日", "月", "火", "水", "木", "金", "土"][tomorrowWd]}`]);
+    const todayWd = new Date(today.date + "T00:00:00").getDay();
+    if (todayWd === 1 && isGoodSymbol(symToday)) add("月に☆〇→翌日", weights["月に☆〇→翌日"]);
     if (fixedNoPoints[no]) {
       reasons.push({ label: `${no}番の実績（固定）`, points: fixedNoPoints[no], sampleSize: null, matchedRate: null });
       total += fixedNoPoints[no];
+    }
+    // v6.9.6 ④: per-machine persistence/anti-persistence — ⚠️低信頼
+    if (isGoodSymbol(symToday) && perNoPersistencePoints[no]) {
+      const pp = perNoPersistencePoints[no];
+      reasons.push({ label: `${no}番の持続性傾向（⚠️低信頼）`, points: pp.points, sampleSize: pp.sampleSize, matchedRate: pp.matchedRate });
+      total += pp.points;
     }
 
     results.push({ no, lastDate: today.date, totalPoints: total, reasons: reasons.sort((a, b) => b.points - a.points) });
