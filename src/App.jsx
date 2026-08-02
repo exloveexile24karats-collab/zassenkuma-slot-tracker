@@ -310,7 +310,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // 入力欄＋ボタンの組み合わせでスマホ幅に収まらず、画面全体が横に動いて
 // しまっていた（flexWrapが無く、入力欄の最小幅も固定だった）のを修正。
 // 行を折り返せるようにし、入力欄も画面幅に応じて縮められるようにした。
-const APP_VERSION = "6.9.9";
+// v6.9.10: 「共通設定」を管理者用の一元窓口にする大きめの整理。①全体
+// ランキングタブを削除。②機種×日付マトリクス表の説明文からバージョン
+// 履歴（v6.8等）の言及を削除し、表の見方＋注意点だけのシンプルな文言に
+// 変更。③民レポ・アナスロのデータ入力欄と登録済みの日付一覧を、全体
+// データタブから共通設定タブに移動。④各機種ページに個別にあった暗証番号
+// 入力フォームを削除し、共通設定の1箇所で解除すればどのページも一緒に
+// 解除される仕組みに統一（unlockedは元々アプリ全体で共有の状態なので、
+// 各ページの入力フォームを消しても解除自体の動作は変わらない）。
+// v6.9.11: 各機種ページに残っていた「データ入力をロックする」ボタンも
+// 削除。ロック/解除の操作は共通設定だけで行う形に統一した。
+const APP_VERSION = "6.9.11";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4818,13 +4828,6 @@ export default function SlotDataTracker() {
       {/* page tabs */}
       <div style={{ display: "flex", alignItems: "flex-end", gap: "4px", marginBottom: "0", flexWrap: "wrap" }}>
         <div
-          className={"page-tab" + (viewMode === "ranking" ? " active" : "")}
-          onClick={() => setViewMode("ranking")}
-          style={{ display: "flex", alignItems: "center", gap: "6px" }}
-        >
-          <span>🏅 全体ランキング</span>
-        </div>
-        <div
           className={"page-tab" + (viewMode === "common" ? " active" : "")}
           onClick={() => setViewMode("common")}
           style={{ display: "flex", alignItems: "center", gap: "6px" }}
@@ -4885,50 +4888,284 @@ export default function SlotDataTracker() {
 
       <div style={{ borderTop: "1px solid #2a323f", marginBottom: "16px" }} />
 
-      {viewMode === "ranking" ? (
-        <div style={{ maxWidth: "760px" }}>
-          {/* hall-wide combined ranking: every page's machines together, no 機種 boundary */}
-          <div className="card" style={{ padding: "18px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              🏅 全機種合算ランキング（機種の隔たり無し）
-            </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-              全ての機種ページの台をひとまとめにして、総合スコアが高い順にランク付けします。狙い台を機種を問わず探したいときはこちらを見てください。
-            </div>
-            {allPagesPickList.length === 0 ? (
-              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
-            ) : (
-              <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "10px" }}>
-                {allPagesPickList.map((p) => (
-                  <div key={p.pageId + "-" + p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "9px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      {p.grade && (
-                        <span className="mono" style={{
-                          fontSize: "12px", fontWeight: 800, width: "20px", height: "20px", lineHeight: "20px",
-                          textAlign: "center", borderRadius: "50%", color: "#12161d",
-                          background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
-                        }}>
-                          {p.grade}
-                        </span>
-                      )}
-                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
-                      <span style={{ fontSize: "11px", color: "#8b93a3" }}>{p.pageLabel}</span>
-                    </span>
-                    {p.totalPoints !== null && p.totalPoints !== undefined && (
-                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a", borderRadius: "4px", padding: "1px 6px" }}>
-                        実証済み{p.strongSignalCount}個（全{p.signalCount}件根拠）
-                      </span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      ) : viewMode === "common" ? (
+      {viewMode === "common" ? (
         <div style={{ maxWidth: "760px" }}>
           {unlocked ? (
             <>
+            <div className="card" style={{ padding: "18px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+                民レポ
+              </div>
+              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+                両方の表をそのまま1つに貼り付けてください（「末尾別データ」の行で自動的に区切ります）。日付にはイベント登録の内容が自動で反映されます。
+              </div>
+              <div style={{ marginBottom: "10px" }}>
+                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
+                <input
+                  type="date"
+                  value={overallDate}
+                  onChange={(e) => {
+                    const newDate = e.target.value;
+                    setOverallDate(newDate);
+                    const existing = overallSummaries.find((s) => s.date === newDate);
+                    if (existing) {
+                      setOverallPasteText(serializeOverallSummary(existing));
+                      setOverallStatus({ type: "ok", msg: `${newDate} は登録済みです。編集用に読み込みました。` });
+                    } else {
+                      setOverallPasteText("");
+                      setOverallStatus(null);
+                    }
+                    loadFullTableForDate(newDate);
+                  }}
+                  style={{
+                    display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
+                  }}
+                />
+              </div>
+              {dateEventMap[overallDate] && (
+                <div style={{
+                  fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
+                  background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
+                  display: "flex", alignItems: "center", gap: "6px",
+                }}>
+                  <Flag size={12} />
+                  この日のイベント：{dateEventMap[overallDate]}
+                </div>
+              )}
+              <textarea
+                className="mono scrollbar"
+                value={overallPasteText}
+                onChange={(e) => setOverallPasteText(e.target.value)}
+                placeholder={"機種\t平均差枚\t平均G数\t勝率\t出率\nLアズールレーン THE ANIMATION\t3,500\t3,596\t2/4\t132.4%\n...\n末尾別データ\n末尾\t平均差枚\t平均G数\t勝率\t出率\n0\t868\t5,513\t24/56\t105.2%\n..."}
+                rows={12}
+                style={{
+                  width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
+                  boxSizing: "border-box", marginBottom: "10px",
+                }}
+              />
+              <button
+                onClick={handleSaveOverall}
+                style={{
+                  width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
+                  padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                }}
+              >
+                この日のデータを保存
+              </button>
+              {overallStatus && (
+                <div style={{ marginTop: "8px", fontSize: "11px", color: overallStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                  {overallStatus.msg}
+                </div>
+              )}
+
+              <div style={{ marginTop: "20px", borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
+                <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+                  🗂 アナスロ
+                </div>
+                <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+                  機種名・台番号・G数（通常時）・差枚・BB・RB・合成確率・BB確率・RB確率の一覧表を、店全体分まとめて貼り付けます。正式名称が一致するページ全部に自動反映されます（機種ごとの個別入力は廃止しました）。G数は通常時のみのため、出率（☆◎◯▲マーク）はこの経路では計算されません。
+                </div>
+                <div style={{ marginBottom: "10px" }}>
+                  <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
+                  <input
+                    type="date"
+                    value={fullTableDate}
+                    onChange={(e) => loadFullTableForDate(e.target.value)}
+                    style={{
+                      display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                      borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
+                    }}
+                  />
+                  <div style={{ marginTop: "4px", fontSize: "11px", color: rawFullTable[fullTableDate] ? "#9ece6a" : "#5a6272" }}>
+                    {rawFullTable[fullTableDate] ? `この日は登録済み（${rawFullTable[fullTableDate].length}台分）` : "この日はまだ未登録です"}
+                  </div>
+                </div>
+                <textarea
+                  className="mono scrollbar"
+                  value={fullTablePasteText}
+                  onChange={(e) => setFullTablePasteText(e.target.value)}
+                  placeholder={"機種名\t台番号\tG数\t差枚\tBB\tRB\t合成確率\tBB確率\tRB確率\nモンキーターンV\t185\t4,318\t169\t40\t15\t1/78.5\t1/108.0\t1/287.9\n..."}
+                  rows={10}
+                  style={{
+                    width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
+                    padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
+                    boxSizing: "border-box", marginBottom: "10px",
+                  }}
+                />
+                <button
+                  onClick={() => handleSaveFullTable()}
+                  style={{
+                    width: "100%", background: "#4fd1c5", color: "#0b1f1c", border: "none", borderRadius: "8px",
+                    padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                  }}
+                >
+                  この日の一括データを保存
+                </button>
+                {fullTableDuplicateWarning && (
+                  <div style={{
+                    marginTop: "8px", padding: "10px", borderRadius: "6px", fontSize: "12px",
+                    background: "#2a1418", border: "1px solid #7a3038", color: "#e5697a",
+                  }}>
+                    ⚠ この内容は {fullTableDuplicateWarning.conflictingDate} と完全に同じデータです。日付を間違えて同じ表を貼り付けていませんか？
+                    <div style={{ marginTop: "8px", display: "flex", gap: "8px" }}>
+                      <button
+                        onClick={() => handleSaveFullTable({ force: true })}
+                        style={{ fontSize: "11px", background: "none", border: "1px solid #7a3038", borderRadius: "6px", color: "#e5697a", padding: "5px 8px", cursor: "pointer" }}
+                      >
+                        同じで間違いない・無視して保存
+                      </button>
+                      <button
+                        onClick={() => setFullTableDuplicateWarning(null)}
+                        style={{ fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "5px 8px", cursor: "pointer" }}
+                      >
+                        取消（貼り直す）
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {fullTableStatus && (
+                  <div style={{ marginTop: "8px", fontSize: "11px", color: fullTableStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                    {fullTableStatus.msg}
+                  </div>
+                )}
+                <div style={{ marginTop: "10px" }}>
+                  <button
+                    onClick={handleCheckFullTableDuplicates}
+                    style={{ fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "6px 10px", cursor: "pointer" }}
+                  >
+                    🔍 登録済み日付を重複チェック
+                  </button>
+                  {fullTableDuplicateCheckResults && (
+                    <div style={{ marginTop: "8px", fontSize: "11px" }}>
+                      {fullTableDuplicateCheckResults.length === 0 ? (
+                        <span style={{ color: "#9ece6a" }}>重複は見つかりませんでした。</span>
+                      ) : (
+                        <div style={{ color: "#e5697a" }}>
+                          {fullTableDuplicateCheckResults.length}件の重複ペアが見つかりました：
+                          <ul style={{ margin: "4px 0 0", paddingLeft: "18px" }}>
+                            {fullTableDuplicateCheckResults.map(([a, b]) => (
+                              <li key={`${a}-${b}`}>{a} ⇔ {b}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
+                    登録済みの日付（{new Set([...overallSummaries.map((s) => s.date), ...Object.keys(rawFullTable)]).size}件）
+                  </div>
+                  {overallSummaries.length > 0 && (
+                    confirmDeleteAllOverall ? (
+                      <span style={{ display: "flex", gap: "6px" }}>
+                        <span style={{ fontSize: "11px", color: "#e5697a" }}>本当に全部削除しますか？</span>
+                        <button onClick={handleDeleteAllOverall} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>
+                          削除する
+                        </button>
+                        <button onClick={() => setConfirmDeleteAllOverall(false)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>
+                          取消
+                        </button>
+                      </span>
+                    ) : (
+                      <button onClick={() => setConfirmDeleteAllOverall(true)} style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px" }}>
+                        <Trash2 size={11} />
+                        全部削除
+                      </button>
+                    )
+                  )}
+                </div>
+                <div className="scrollbar" style={{ maxHeight: "180px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+                  {!overallSummariesLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
+                  {overallSummariesLoaded && overallSortedSummaries.length === 0 && Object.keys(rawFullTable).length === 0 && (
+                    <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
+                  )}
+                  {(() => {
+                    const overallByDate = {};
+                    overallSortedSummaries.forEach((s) => { overallByDate[s.date] = s; });
+                    // v6.9.2: union of 民レポ dates AND アナスロ dates — previously
+                    // this list only ever showed 民レポ dates, so a date entered
+                    // in アナスロ first (before 民レポ) never appeared at all.
+                    const allDates = Array.from(new Set([...overallSortedSummaries.map((s) => s.date), ...Object.keys(rawFullTable)])).sort();
+                    return [...allDates].reverse().map((date) => {
+                      const s = overallByDate[date] || null;
+                      const hasFullTable = !!rawFullTable[date];
+                      return (
+                    <div
+                      key={date}
+                      onClick={() => (s ? handleEditOverall(s) : (setOverallDate(date), setOverallPasteText(""), setOverallStatus(null), loadFullTableForDate(date)))}
+                      title="クリックでこの日のデータを編集"
+                      style={{
+                        display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                        background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
+                        cursor: "pointer",
+                      }}>
+                      <div>
+                        <span className="mono">{date}</span>
+                        {s && s.event && (() => {
+                          const names = splitEventNames(s.event);
+                          const isStrong = names.some((n) => strongEventColorByName[n]);
+                          const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
+                          if (isStrong) {
+                            return (
+                              <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR }}>
+                                <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={STRONG_EVENT_COLOR} />
+                                {s.event}
+                              </span>
+                            );
+                          }
+                          if (isSemi) {
+                            return (
+                              <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR }}>
+                                <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
+                                {s.event}
+                              </span>
+                            );
+                          }
+                          return (
+                            <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR }}>
+                              <Star size={10} style={{ display: "inline", marginRight: "2px" }} />
+                              {s.event}
+                            </span>
+                          );
+                        })()}
+                        {s && <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>}
+                        <span style={{ marginLeft: "6px", color: s ? "#9ece6a" : "#e5697a" }}>
+                          民レポ{s ? "〇" : "未登録"}
+                        </span>
+                        <span style={{ marginLeft: "6px", color: hasFullTable ? "#9ece6a" : "#e5697a" }}>
+                          アナスロ{hasFullTable ? "〇" : "未登録"}
+                        </span>
+                      </div>
+                      {s || hasFullTable ? (
+                        confirmDeleteOverall === date ? (
+                          <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
+                            <button
+                              onClick={() => (s ? handleDeleteOverall(date) : handleDeleteFullTableDate(date))}
+                              style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}
+                            >
+                              削除する
+                            </button>
+                            <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
+                          </div>
+                        ) : (
+                          <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteOverall(date); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                            <Trash2 size={13} />
+                          </button>
+                        )
+                      ) : null}
+                    </div>
+                      );
+                    });
+                  })()}
+                </div>
+              </div>
+            </div>
           {/* export everything for offline analysis / backtesting */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
@@ -5420,7 +5657,7 @@ export default function SlotDataTracker() {
                 <Lock size={14} /> 共通設定はロック中です
               </div>
               <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-                暗証番号を入力すると、イベント登録・強いイベント・店休日・おすすめ機種期間を編集できます。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
+                暗証番号を入力すると、データ入力（民レポ・アナスロ）・イベント登録・強いイベント・店休日・おすすめ機種期間・各機種ページの編集ができるようになります。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
               </div>
               <div style={{ display: "flex", gap: "8px" }}>
                 <input
@@ -5734,318 +5971,6 @@ export default function SlotDataTracker() {
             )}
           </div>
 
-          {/* data entry, locked behind the same PIN as everything else */}
-          {unlocked ? (
-            <div className="card" style={{ padding: "18px" }}>
-              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-                民レポ
-              </div>
-              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-                両方の表をそのまま1つに貼り付けてください（「末尾別データ」の行で自動的に区切ります）。日付にはイベント登録の内容が自動で反映されます。
-              </div>
-              <div style={{ marginBottom: "10px" }}>
-                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
-                <input
-                  type="date"
-                  value={overallDate}
-                  onChange={(e) => {
-                    const newDate = e.target.value;
-                    setOverallDate(newDate);
-                    const existing = overallSummaries.find((s) => s.date === newDate);
-                    if (existing) {
-                      setOverallPasteText(serializeOverallSummary(existing));
-                      setOverallStatus({ type: "ok", msg: `${newDate} は登録済みです。編集用に読み込みました。` });
-                    } else {
-                      setOverallPasteText("");
-                      setOverallStatus(null);
-                    }
-                    loadFullTableForDate(newDate);
-                  }}
-                  style={{
-                    display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
-                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
-                  }}
-                />
-              </div>
-              {dateEventMap[overallDate] && (
-                <div style={{
-                  fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
-                  background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
-                  display: "flex", alignItems: "center", gap: "6px",
-                }}>
-                  <Flag size={12} />
-                  この日のイベント：{dateEventMap[overallDate]}
-                </div>
-              )}
-              <textarea
-                className="mono scrollbar"
-                value={overallPasteText}
-                onChange={(e) => setOverallPasteText(e.target.value)}
-                placeholder={"機種\t平均差枚\t平均G数\t勝率\t出率\nLアズールレーン THE ANIMATION\t3,500\t3,596\t2/4\t132.4%\n...\n末尾別データ\n末尾\t平均差枚\t平均G数\t勝率\t出率\n0\t868\t5,513\t24/56\t105.2%\n..."}
-                rows={12}
-                style={{
-                  width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
-                  padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
-                  boxSizing: "border-box", marginBottom: "10px",
-                }}
-              />
-              <button
-                onClick={handleSaveOverall}
-                style={{
-                  width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                  padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
-                }}
-              >
-                この日のデータを保存
-              </button>
-              {overallStatus && (
-                <div style={{ marginTop: "8px", fontSize: "11px", color: overallStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
-                  {overallStatus.msg}
-                </div>
-              )}
-
-              <div style={{ marginTop: "20px", borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
-                <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-                  🗂 アナスロ
-                </div>
-                <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-                  機種名・台番号・G数（通常時）・差枚・BB・RB・合成確率・BB確率・RB確率の一覧表を、店全体分まとめて貼り付けます。正式名称が一致するページ全部に自動反映されます（機種ごとの個別入力は廃止しました）。G数は通常時のみのため、出率（☆◎◯▲マーク）はこの経路では計算されません。
-                </div>
-                <div style={{ marginBottom: "10px" }}>
-                  <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
-                  <input
-                    type="date"
-                    value={fullTableDate}
-                    onChange={(e) => loadFullTableForDate(e.target.value)}
-                    style={{
-                      display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
-                      borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
-                    }}
-                  />
-                  <div style={{ marginTop: "4px", fontSize: "11px", color: rawFullTable[fullTableDate] ? "#9ece6a" : "#5a6272" }}>
-                    {rawFullTable[fullTableDate] ? `この日は登録済み（${rawFullTable[fullTableDate].length}台分）` : "この日はまだ未登録です"}
-                  </div>
-                </div>
-                <textarea
-                  className="mono scrollbar"
-                  value={fullTablePasteText}
-                  onChange={(e) => setFullTablePasteText(e.target.value)}
-                  placeholder={"機種名\t台番号\tG数\t差枚\tBB\tRB\t合成確率\tBB確率\tRB確率\nモンキーターンV\t185\t4,318\t169\t40\t15\t1/78.5\t1/108.0\t1/287.9\n..."}
-                  rows={10}
-                  style={{
-                    width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
-                    padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
-                    boxSizing: "border-box", marginBottom: "10px",
-                  }}
-                />
-                <button
-                  onClick={() => handleSaveFullTable()}
-                  style={{
-                    width: "100%", background: "#4fd1c5", color: "#0b1f1c", border: "none", borderRadius: "8px",
-                    padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
-                  }}
-                >
-                  この日の一括データを保存
-                </button>
-                {fullTableDuplicateWarning && (
-                  <div style={{
-                    marginTop: "8px", padding: "10px", borderRadius: "6px", fontSize: "12px",
-                    background: "#2a1418", border: "1px solid #7a3038", color: "#e5697a",
-                  }}>
-                    ⚠ この内容は {fullTableDuplicateWarning.conflictingDate} と完全に同じデータです。日付を間違えて同じ表を貼り付けていませんか？
-                    <div style={{ marginTop: "8px", display: "flex", gap: "8px" }}>
-                      <button
-                        onClick={() => handleSaveFullTable({ force: true })}
-                        style={{ fontSize: "11px", background: "none", border: "1px solid #7a3038", borderRadius: "6px", color: "#e5697a", padding: "5px 8px", cursor: "pointer" }}
-                      >
-                        同じで間違いない・無視して保存
-                      </button>
-                      <button
-                        onClick={() => setFullTableDuplicateWarning(null)}
-                        style={{ fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "5px 8px", cursor: "pointer" }}
-                      >
-                        取消（貼り直す）
-                      </button>
-                    </div>
-                  </div>
-                )}
-                {fullTableStatus && (
-                  <div style={{ marginTop: "8px", fontSize: "11px", color: fullTableStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
-                    {fullTableStatus.msg}
-                  </div>
-                )}
-                <div style={{ marginTop: "10px" }}>
-                  <button
-                    onClick={handleCheckFullTableDuplicates}
-                    style={{ fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "6px 10px", cursor: "pointer" }}
-                  >
-                    🔍 登録済み日付を重複チェック
-                  </button>
-                  {fullTableDuplicateCheckResults && (
-                    <div style={{ marginTop: "8px", fontSize: "11px" }}>
-                      {fullTableDuplicateCheckResults.length === 0 ? (
-                        <span style={{ color: "#9ece6a" }}>重複は見つかりませんでした。</span>
-                      ) : (
-                        <div style={{ color: "#e5697a" }}>
-                          {fullTableDuplicateCheckResults.length}件の重複ペアが見つかりました：
-                          <ul style={{ margin: "4px 0 0", paddingLeft: "18px" }}>
-                            {fullTableDuplicateCheckResults.map(([a, b]) => (
-                              <li key={`${a}-${b}`}>{a} ⇔ {b}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
-                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
-                    登録済みの日付（{new Set([...overallSummaries.map((s) => s.date), ...Object.keys(rawFullTable)]).size}件）
-                  </div>
-                  {overallSummaries.length > 0 && (
-                    confirmDeleteAllOverall ? (
-                      <span style={{ display: "flex", gap: "6px" }}>
-                        <span style={{ fontSize: "11px", color: "#e5697a" }}>本当に全部削除しますか？</span>
-                        <button onClick={handleDeleteAllOverall} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>
-                          削除する
-                        </button>
-                        <button onClick={() => setConfirmDeleteAllOverall(false)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>
-                          取消
-                        </button>
-                      </span>
-                    ) : (
-                      <button onClick={() => setConfirmDeleteAllOverall(true)} style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px" }}>
-                        <Trash2 size={11} />
-                        全部削除
-                      </button>
-                    )
-                  )}
-                </div>
-                <div className="scrollbar" style={{ maxHeight: "180px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
-                  {!overallSummariesLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
-                  {overallSummariesLoaded && overallSortedSummaries.length === 0 && Object.keys(rawFullTable).length === 0 && (
-                    <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
-                  )}
-                  {(() => {
-                    const overallByDate = {};
-                    overallSortedSummaries.forEach((s) => { overallByDate[s.date] = s; });
-                    // v6.9.2: union of 民レポ dates AND アナスロ dates — previously
-                    // this list only ever showed 民レポ dates, so a date entered
-                    // in アナスロ first (before 民レポ) never appeared at all.
-                    const allDates = Array.from(new Set([...overallSortedSummaries.map((s) => s.date), ...Object.keys(rawFullTable)])).sort();
-                    return [...allDates].reverse().map((date) => {
-                      const s = overallByDate[date] || null;
-                      const hasFullTable = !!rawFullTable[date];
-                      return (
-                    <div
-                      key={date}
-                      onClick={() => (s ? handleEditOverall(s) : (setOverallDate(date), setOverallPasteText(""), setOverallStatus(null), loadFullTableForDate(date)))}
-                      title="クリックでこの日のデータを編集"
-                      style={{
-                        display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
-                        background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
-                        cursor: "pointer",
-                      }}>
-                      <div>
-                        <span className="mono">{date}</span>
-                        {s && s.event && (() => {
-                          const names = splitEventNames(s.event);
-                          const isStrong = names.some((n) => strongEventColorByName[n]);
-                          const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
-                          if (isStrong) {
-                            return (
-                              <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR }}>
-                                <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={STRONG_EVENT_COLOR} />
-                                {s.event}
-                              </span>
-                            );
-                          }
-                          if (isSemi) {
-                            return (
-                              <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR }}>
-                                <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
-                                {s.event}
-                              </span>
-                            );
-                          }
-                          return (
-                            <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR }}>
-                              <Star size={10} style={{ display: "inline", marginRight: "2px" }} />
-                              {s.event}
-                            </span>
-                          );
-                        })()}
-                        {s && <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>}
-                        <span style={{ marginLeft: "6px", color: s ? "#9ece6a" : "#e5697a" }}>
-                          民レポ{s ? "〇" : "未登録"}
-                        </span>
-                        <span style={{ marginLeft: "6px", color: hasFullTable ? "#9ece6a" : "#e5697a" }}>
-                          アナスロ{hasFullTable ? "〇" : "未登録"}
-                        </span>
-                      </div>
-                      {s || hasFullTable ? (
-                        confirmDeleteOverall === date ? (
-                          <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
-                            <button
-                              onClick={() => (s ? handleDeleteOverall(date) : handleDeleteFullTableDate(date))}
-                              style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}
-                            >
-                              削除する
-                            </button>
-                            <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
-                          </div>
-                        ) : (
-                          <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteOverall(date); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
-                            <Trash2 size={13} />
-                          </button>
-                        )
-                      ) : null}
-                    </div>
-                      );
-                    });
-                  })()}
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="card" style={{ padding: "18px" }}>
-              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
-                <Lock size={14} /> データ入力はロック中です
-              </div>
-              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-                暗証番号を入力すると、機種別サマリー・末尾別データを入力できます。上のおすすめ表示は鍵なしで見られます。
-              </div>
-              <div style={{ display: "flex", gap: "8px" }}>
-                <input
-                  type="password"
-                  inputMode="numeric"
-                  value={pinInput}
-                  onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
-                  onKeyDown={(e) => { if (e.key === "Enter") handleUnlock(); }}
-                  placeholder="暗証番号"
-                  style={{
-                    flex: 1, background: "#12161d", border: "1px solid " + (pinError ? "#e5697a" : "#2a323f"),
-                    borderRadius: "6px", padding: "8px", color: "#e7e9ee", fontSize: "13px",
-                  }}
-                />
-                <button
-                  onClick={handleUnlock}
-                  style={{
-                    background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                    padding: "0 16px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
-                  }}
-                >
-                  解除
-                </button>
-              </div>
-              {pinError && (
-                <div style={{ marginTop: "8px", fontSize: "11px", color: "#e5697a" }}>暗証番号が違います。</div>
-              )}
-            </div>
-          )}
         </div>
       ) : (
         <>
@@ -6202,51 +6127,15 @@ export default function SlotDataTracker() {
             </div>
           </div>
 
-          <button
-            onClick={() => { setUnlocked(false); setPinInput(""); setPinError(false); }}
-            style={{
-              display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
-              width: "100%", background: "transparent", border: "1px solid #2a323f", borderRadius: "8px",
-              padding: "8px", color: "#5a6272", fontSize: "12px", cursor: "pointer",
-            }}
-          >
-            <Lock size={12} /> データ入力をロックする
-          </button>
           </>
           ) : (
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
               <Lock size={14} /> データ入力はロック中です
             </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-              暗証番号を入力すると、データ入力・強いイベント・店休日を編集できます。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
+            <div style={{ fontSize: "11px", color: "#5a6272" }}>
+              🔧 共通設定で暗証番号を入力すると、ここも解除されます。
             </div>
-            <div style={{ display: "flex", gap: "8px" }}>
-              <input
-                type="password"
-                inputMode="numeric"
-                value={pinInput}
-                onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
-                onKeyDown={(e) => { if (e.key === "Enter") handleUnlock(); }}
-                placeholder="暗証番号"
-                style={{
-                  flex: 1, background: "#12161d", border: "1px solid " + (pinError ? "#e5697a" : "#2a323f"),
-                  borderRadius: "6px", padding: "8px", color: "#e7e9ee", fontSize: "13px",
-                }}
-              />
-              <button
-                onClick={handleUnlock}
-                style={{
-                  background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                  padding: "0 16px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
-                }}
-              >
-                解除
-              </button>
-            </div>
-            {pinError && (
-              <div style={{ marginTop: "8px", fontSize: "11px", color: "#e5697a" }}>暗証番号が違います。</div>
-            )}
           </div>
           )}
 
@@ -6256,7 +6145,9 @@ export default function SlotDataTracker() {
               📋 台番号×日付マトリクス表
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              このページの台番号ごとに、日付ごとの数値を一覧表示します（v6.8より出率ベースの簡易マークは廃止）。設定判別プロファイルが登録済みの機種（モンキーターンV・マイジャグラーV）は設定期待度（0〜100、高いほど緑）を表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
+              このページの台番号ごとに、日付ごとの数値を一覧表示します。設定判別プロファイルが登録済みの機種（モンキーターンV・マイジャグラーV・東京喰種・甲鉄城のカバネリ）は設定期待度（0〜100、高いほど赤・低いほど灰色）を表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
+              <br />
+              ⚠️ この数値はあくまで参考の目安です。実際の設定を保証するものではありません。
             </div>
             {renderEventMultiSelect(pageGridEventFilter, setPageGridEventFilter)}
             {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => `${no}番`)}
