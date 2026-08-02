@@ -306,7 +306,11 @@ const DIGIT7_COLOR = "#f6a04d";
 // の主因だった可能性が高い。⑤ピンチズーム無効化はindex.htmlのviewport
 // メタタグの変更が必要で、この会話にはindex.htmlが無いため未対応（別途
 // ファイルを共有してもらうか、案内した内容を反映してもらう必要がある）。
-const APP_VERSION = "6.9.8";
+// v6.9.9: 「正式名称（アナスロと連携）」の行が、ラベル文字＋280px固定幅の
+// 入力欄＋ボタンの組み合わせでスマホ幅に収まらず、画面全体が横に動いて
+// しまっていた（flexWrapが無く、入力欄の最小幅も固定だった）のを修正。
+// 行を折り返せるようにし、入力欄も画面幅に応じて縮められるようにした。
+const APP_VERSION = "6.9.9";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -6065,7 +6069,7 @@ export default function SlotDataTracker() {
           }}
         />
       </div>
-      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
+      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
         <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（アナスロと連携・任意）：</span>
         <input
           type="text"
@@ -6081,7 +6085,10 @@ export default function SlotDataTracker() {
             borderRadius: "6px",
             color: unlocked ? "#e7e9ee" : "#5a6272",
             padding: "5px 8px",
-            minWidth: "280px",
+            flex: "1 1 200px",
+            minWidth: 0,
+            maxWidth: "100%",
+            boxSizing: "border-box",
             cursor: unlocked ? "text" : "not-allowed",
           }}
         />
@@ -6093,7 +6100,7 @@ export default function SlotDataTracker() {
             fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px",
             color: unlocked && currentPage && currentPage.officialName ? "#8b93a3" : "#3a3f4a",
             padding: "5px 8px", cursor: unlocked && currentPage && currentPage.officialName ? "pointer" : "not-allowed",
-            whiteSpace: "nowrap",
+            whiteSpace: "nowrap", flexShrink: 0,
           }}
         >
           🔄 アナスロから再取得
