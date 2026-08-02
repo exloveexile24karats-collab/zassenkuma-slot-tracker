@@ -288,7 +288,11 @@ const DIGIT7_COLOR = "#f6a04d";
 // 翌日も、という組み合わせ、多重比較の疑いは注意コメントとして残した）と
 // 「台ごとの持続性/反持続性」（機種全体でまとめず台番号ごとに個別集計、
 // ⚠️低信頼のラベル付きで表示、上下限±15ptに制限）。
-const APP_VERSION = "6.9.6";
+// v6.9.7: 登録済みの日付一覧で、アナスロのみ登録済み（民レポ未登録）の
+// 日付に削除ボタンが表示されていなかった（削除処理が民レポ側の実装にしか
+// 対応していなかった）のを修正。アナスロ単独の日付も削除できるように、
+// 専用の削除関数を追加した。
+const APP_VERSION = "6.9.7";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2703,6 +2707,32 @@ export default function SlotDataTracker() {
   function handleDeleteOverall(date) {
     pushUndoEntry(`全体データ ${date} を削除`, OVERALL_SUMMARY_KEY, overallSummaries);
     persistOverallSummaries(overallSummaries.filter((s) => s.date !== date));
+    setConfirmDeleteOverall(null);
+  }
+
+  // v6.9.7: dates with only アナスロ data (no 民レポ entry) had no delete
+  // affordance at all in the registered-dates list, since the existing
+  // delete button was tied to a 民レポ summary object. This deletes that
+  // one date's per-date アナスロ key and removes it from the index.
+  async function handleDeleteFullTableDate(date) {
+    const nextRaw = { ...rawFullTableRef.current };
+    delete nextRaw[date];
+    rawFullTableRef.current = nextRaw;
+    setRawFullTable(nextRaw);
+    try {
+      await storage.delete(rawFullTableDateKey(date), false);
+    } catch (e) {
+      // storage delete failing isn't fatal here — the in-memory state above
+      // already reflects the removal; next full reload will just re-fetch
+      // the (still-deleted, since we succeeded locally) missing key normally
+    }
+    rawFullTableIndexRef.current = rawFullTableIndexRef.current.filter((d) => d !== date);
+    try {
+      await storage.set(RAW_FULLTABLE_INDEX_KEY, JSON.stringify(rawFullTableIndexRef.current), false);
+    } catch (e) {
+      // if this fails, the next load's reconciliation pass will just find
+      // the date missing from storage anyway and self-correct the index
+    }
     setConfirmDeleteOverall(null);
   }
 
@@ -5920,10 +5950,15 @@ export default function SlotDataTracker() {
                           アナスロ{hasFullTable ? "〇" : "未登録"}
                         </span>
                       </div>
-                      {s ? (
+                      {s || hasFullTable ? (
                         confirmDeleteOverall === date ? (
                           <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
-                            <button onClick={() => handleDeleteOverall(date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
+                            <button
+                              onClick={() => (s ? handleDeleteOverall(date) : handleDeleteFullTableDate(date))}
+                              style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}
+                            >
+                              削除する
+                            </button>
                             <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
                           </div>
                         ) : (
