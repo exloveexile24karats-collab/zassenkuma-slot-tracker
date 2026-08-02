@@ -292,7 +292,21 @@ const DIGIT7_COLOR = "#f6a04d";
 // 日付に削除ボタンが表示されていなかった（削除処理が民レポ側の実装にしか
 // 対応していなかった）のを修正。アナスロ単独の日付も削除できるように、
 // 専用の削除関数を追加した。
-const APP_VERSION = "6.9.7";
+// v6.9.8: スマホでの指摘4点＋1点を修正。①「正式名称（アナスロと連携）」
+// の入力欄が暗証番号を解除しなくても編集できてしまっていたのを修正（他の
+// 編集項目と同様、unlockedでロックするように）。②「機種を選択して過去
+// 一覧を見る」のプルダウンが画面からはみ出していたのを修正（flexアイテム
+// にminWidth:0を指定していなかったため、長い機種名がコンテナ幅を無視して
+// 広がっていた）。③機種×日付マトリクス表の固定列（機種名）が長い名前だと
+// 広がりすぎて日付列がほぼ見えなくなっていたのを修正（最大幅を固定して
+// はみ出す名前は「...」で省略、タップ/ホバーで全文表示）。④全体データ
+// タブ等を見ている間も、実測パターンエンジンの重い計算（全台×全日×約20
+// パターンの学習）が裏で動き続けていたのを修正（機種ページを実際に開いて
+// いる時だけ計算するように変更）。これがスマホでの「反映がめっちゃ遅い」
+// の主因だった可能性が高い。⑤ピンチズーム無効化はindex.htmlのviewport
+// メタタグの変更が必要で、この会話にはindex.htmlが無いため未対応（別途
+// ファイルを共有してもらうか、案内した内容を反映してもらう必要がある）。
+const APP_VERSION = "6.9.8";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -3689,6 +3703,17 @@ export default function SlotDataTracker() {
   // own history, not a fixed/hand-picked weight. Pages without a profile
   // keep using pickList (the original system) unchanged.
   const symbolPickup = useMemo(() => {
+    // v6.9.8: this is a genuinely heavy computation (a full pass over every
+    // machine × every day for ~20 candidate patterns) and was previously
+    // running on every render where currentPage/sortedHistory changed,
+    // REGARDLESS of which tab was actually visible — since currentPage
+    // stays set to whatever machine page was last opened even while looking
+    // at 全体データ/共通設定/全体ランキング, this meant the heavy pass kept
+    // recomputing invisibly in the background on those other tabs too,
+    // which is exactly the kind of thing that shows up as "everything feels
+    // stuck/slow" on a weaker mobile CPU. Only compute it while a machine
+    // page tab is actually the one being viewed.
+    if (viewMode !== "page") return null;
     const officialName = currentPage && currentPage.officialName;
     if (!officialName) return null;
     const ctx = buildSymbolContext(officialName, sortedHistory);
@@ -3699,7 +3724,7 @@ export default function SlotDataTracker() {
     const activeNos = latestEntry ? new Set(latestEntry.machines.map((m) => m.no)) : null;
     const filtered = activeNos ? results.filter((r) => activeNos.has(r.no)) : results;
     return { results: filtered, overallGoodPct: learned.overallGoodPct };
-  }, [currentPage, sortedHistory, dateEventMap, strongEventNameSet, semiEventNameSet]);
+  }, [viewMode, currentPage, sortedHistory, dateEventMap, strongEventNameSet, semiEventNameSet]);
 
   // hall-wide: every page's machines combined into ONE ranked list, no
   // page/機種 boundary — for spotting the single best "aim" machine anywhere
@@ -4444,7 +4469,14 @@ export default function SlotDataTracker() {
           <tbody>
             {rows.map((row) => (
               <tr key={row}>
-                <td style={{ position: "sticky", left: 0, background: "#12161d", padding: "4px 8px", color: "#c7cbd4", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap" }}>
+                <td
+                  title={rowLabelFn(row)}
+                  style={{
+                    position: "sticky", left: 0, background: "#12161d", padding: "4px 8px", color: "#c7cbd4",
+                    borderBottom: "1px solid #1c2129", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                    maxWidth: "112px", boxSizing: "border-box",
+                  }}
+                >
                   {rowLabelFn(row)}
                 </td>
                 {dates.map((d) => {
@@ -5586,7 +5618,7 @@ export default function SlotDataTracker() {
                 value={modelHistorySelection}
                 onChange={(e) => setModelHistorySelection(e.target.value)}
                 style={{
-                  flex: "2 1 220px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  flex: "2 1 220px", minWidth: 0, maxWidth: "100%", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
                   padding: "7px 8px", color: "#e7e9ee", fontSize: "12px",
                 }}
               >
@@ -5599,7 +5631,7 @@ export default function SlotDataTracker() {
                 value={modelHistoryEventFilter}
                 onChange={(e) => setModelHistoryEventFilter(e.target.value)}
                 style={{
-                  flex: "1 1 160px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  flex: "1 1 160px", minWidth: 0, maxWidth: "100%", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
                   padding: "7px 8px", color: "#e7e9ee", fontSize: "12px",
                 }}
               >
@@ -6041,24 +6073,26 @@ export default function SlotDataTracker() {
           value={currentPage ? currentPage.officialName || "" : ""}
           onChange={(e) => handleSetOfficialName(activePageId, e.target.value)}
           placeholder="例：Lパチスロからくりサーカス2"
+          disabled={!unlocked}
           style={{
             fontSize: "12px",
-            background: "#12161d",
+            background: unlocked ? "#12161d" : "#0d1015",
             border: "1px solid #2a323f",
             borderRadius: "6px",
-            color: "#e7e9ee",
+            color: unlocked ? "#e7e9ee" : "#5a6272",
             padding: "5px 8px",
             minWidth: "280px",
+            cursor: unlocked ? "text" : "not-allowed",
           }}
         />
         <button
           onClick={() => currentPage && currentPage.officialName && backfillPageFromRawTable(activePageId, currentPage.officialName)}
-          disabled={!currentPage || !currentPage.officialName}
-          title="アナスロに貯まっている過去分を、今の正式名称でもう一度取り込み直す（読み込みタイミングの問題などで最初に取り込めなかった場合用）"
+          disabled={!unlocked || !currentPage || !currentPage.officialName}
+          title={unlocked ? "アナスロに貯まっている過去分を、今の正式名称でもう一度取り込み直す（読み込みタイミングの問題などで最初に取り込めなかった場合用）" : "暗証番号を解除すると使えます"}
           style={{
             fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px",
-            color: currentPage && currentPage.officialName ? "#8b93a3" : "#3a3f4a",
-            padding: "5px 8px", cursor: currentPage && currentPage.officialName ? "pointer" : "not-allowed",
+            color: unlocked && currentPage && currentPage.officialName ? "#8b93a3" : "#3a3f4a",
+            padding: "5px 8px", cursor: unlocked && currentPage && currentPage.officialName ? "pointer" : "not-allowed",
             whiteSpace: "nowrap",
           }}
         >
