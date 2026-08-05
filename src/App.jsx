@@ -354,7 +354,27 @@ const DIGIT7_COLOR = "#f6a04d";
 // 修正前は実際に日付が消えること・修正後は消えないことを確認済み。旧形式
 // （v6.8の単一キー・v6.8.1〜4の日付別キー・v6.8.5〜10の月別キー）からの
 // 移行も、週別キーへ正しく統合されることをテストで確認した。
-const APP_VERSION = "6.9.12";
+// v6.9.13: 民レポの「バラエティ（1台設置機種）」セクションは列の並びが
+// 通常機種と違う（機種／台番／差枚／G数／出率で、勝率の列が無い）のに、
+// 通常機種と同じ列解析を使っていたため、台番号が差枚として読まれてし
+// まっていた。ヘッダー文言（「台番」の有無）で判定し、正しい列位置から
+// 差枚・G数・出率を読むように修正。実際の貼り付け例で正しく直ることを
+// 確認済み。
+// v6.9.14: 上記バグで既に保存されてしまっていたデータの修復ツールを共通
+// 設定に追加。バラエティ機種の行は「勝率が読み取れず必ずwins/totalが
+// null」という壊れ方の特徴を目印に自動検出（機種名は使わない — 新台入れ
+// 替えでラインナップが変わるとすぐ使えなくなるため）。候補を一覧表示して
+// 内容を確認してから反映する2段階方式。台番号として保存されてしまってい
+// た値をG数だった欄から正しい差枚に戻し（G数自体は元のバグでどこにも
+// 残っていないため空欄に）、実際のデータで動作確認済み。
+// v6.9.15: 同じ時期のバグで、もう1パターン別の壊れ方があると判明。
+// 「バラエティ（1台設置機種）」という見出し行そのものが、修正前は見出し
+// として認識されず、直後のヘッダー行とくっついてゴミの1行として保存され
+// ていた（名前に「バラエティ」と「機種」の両方を含む、数値は全部null）。
+// これは復元できる数字が元から無いので、修復ツールに削除候補としても
+// 検出・表示するよう拡張。実際のシナリオでテストし、正常な行・修復可能な
+// 行・削除対象のゴミ行がそれぞれ正しく仕分けられることを確認済み。
+const APP_VERSION = "6.9.15";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -442,10 +462,25 @@ function parseSummaryTable(text) {
 
   const rows = [];
   let pendingLabel = "";
+  // v6.9.13: バラエティ（1台設置機種）セクションは列の並びが違う —
+  // 「機種／台番／差枚／G数／出率」で、平均差枚が2列目ではなく3列目、
+  // 勝率の列は無い（1台だけなので分数の勝率が作れない）。通常の
+  // 「機種／平均差枚／平均G数／勝率／出率」ヘッダーと取り違えると、台番号
+  // が差枚として読まれてしまっていた。ヘッダーの文言でどちらの並びかを
+  // 判定し、以後の行をそのモードで読む。
+  let varietyMode = false;
   for (const line of lines) {
-    if (line.includes("機種") && line.includes("平均差枚")) continue; // header
+    if (line.includes("機種") && line.includes("台番")) {
+      varietyMode = true;
+      continue; // variety-section header
+    }
+    if (line.includes("機種") && line.includes("平均差枚")) {
+      varietyMode = false;
+      continue; // header
+    }
     if (line.includes("末尾") && line.includes("平均差枚")) continue; // digit-table header
     if (line === "末尾別データ") continue; // section title
+    if (line.includes("バラエティ") && line.includes("1台設置機種")) continue; // section title
 
     const cols = line.split("\t").map((c) => c.trim());
     if (cols.length < 5) {
@@ -454,6 +489,25 @@ function parseSummaryTable(text) {
     }
     const name = (pendingLabel + cols[0]).trim();
     pendingLabel = "";
+
+    if (varietyMode) {
+      // 機種／台番／差枚／G数／出率 — no 勝率 column at all here
+      const sadaCol = toAsciiMinus(cols[2]);
+      const avgSada = sadaCol === "" ? null : sadaCol === "-" ? -0.01 : parseInt(sadaCol.replace(/,/g, ""), 10);
+      const avgGsu = cols[3] === "-" || cols[3] === "" ? null : parseInt(cols[3].replace(/,/g, ""), 10);
+      const shutsu = cols[4] === "-" ? 99.9 : cols[4] === "" ? null : parseFloat(cols[4].replace("%", ""));
+      if (!name) continue;
+      rows.push({
+        name,
+        avgSada: Number.isNaN(avgSada) ? null : avgSada,
+        avgGsu: Number.isNaN(avgGsu) ? null : avgGsu,
+        wins: null,
+        total: null,
+        shutsu: Number.isNaN(shutsu) ? null : shutsu,
+      });
+      continue;
+    }
+
     const col1 = toAsciiMinus(cols[1]);
     // min-repo shows a bare "-" for 平均差枚 specifically when the average
     // was NEGATIVE (not when data is missing) — so treat it as "a loss of
@@ -1992,6 +2046,8 @@ export default function SlotDataTracker() {
   //      irregular entries, one snapshot per date ----
   const [overallSummaries, setOverallSummaries] = useState([]); // [{date,event,modelRows,digitRows}]
   const [overallSummariesLoaded, setOverallSummariesLoaded] = useState(false);
+  const [varietyRepairPreview, setVarietyRepairPreview] = useState(null); // { fixCandidates: [...], deleteCandidates: [...] } | null if not scanned yet
+  const [varietyRepairDone, setVarietyRepairDone] = useState(false);
   const [overallDate, setOverallDate] = useState(todayStr());
   const [overallPasteText, setOverallPasteText] = useState("");
   const [overallStatus, setOverallStatus] = useState(null);
@@ -2876,6 +2932,84 @@ export default function SlotDataTracker() {
     pushUndoEntry("全体データを全部削除", OVERALL_SUMMARY_KEY, overallSummaries);
     persistOverallSummaries([]);
     setConfirmDeleteAllOverall(false);
+  }
+
+  // v6.9.14: one-time repair tool for the バラエティ（1台設置機種）
+  // misparse bug (fixed in v6.9.13) — before the fix, those rows had
+  // 台番号 saved into avgSada and the real 差枚 saved into avgGsu (真の
+  // G数 was lost entirely, since it fell in the column the old parser
+  // tried to read as a 勝率 fraction and failed). Detected by exactly that
+  // failure signature: wins/total both null, which normal rows essentially
+  // never have (a real machine's day always has *some* win/loss fraction).
+  // Not name-based on purpose — the person pointed out the バラエティ
+  // lineup itself changes with 新台入れ替え, so any fixed name list would
+  // go stale immediately.
+  // v6.9.15: also detects a second, unrelated corruption from the same-era
+  // bug — the "バラエティ（1台設置機種）" section-title LINE itself wasn't
+  // recognized as a title before the fix, so it got glued onto the very
+  // next line (that section's own header row) and saved as one garbage
+  // "machine" entry (name literally containing both "バラエティ" and
+  // "機種", every numeric field null since none of the header's own text
+  // parses as a number). There's nothing real to recover from that one —
+  // it's flagged for deletion, not repair.
+  function scanVarietyRepairCandidates() {
+    const fixCandidates = [];
+    const deleteCandidates = [];
+    overallSummaries.forEach((s) => {
+      (s.modelRows || []).forEach((r, idx) => {
+        if (r.name && r.name.includes("バラエティ") && r.name.includes("機種")) {
+          deleteCandidates.push({ date: s.date, rowIndex: idx, name: r.name });
+          return;
+        }
+        if (r.wins === null && r.total === null && r.avgSada !== null && r.avgSada !== undefined) {
+          fixCandidates.push({
+            date: s.date,
+            rowIndex: idx,
+            name: r.name,
+            oldAvgSada: r.avgSada, // was actually 台番号
+            oldAvgGsu: r.avgGsu, // was actually 差枚
+            fixedAvgSada: r.avgGsu, // recovered 差枚
+          });
+        }
+      });
+    });
+    setVarietyRepairPreview({ fixCandidates, deleteCandidates });
+  }
+
+  function applyVarietyRepair() {
+    if (!varietyRepairPreview) return;
+    const { fixCandidates, deleteCandidates } = varietyRepairPreview;
+    if (fixCandidates.length === 0 && deleteCandidates.length === 0) return;
+    pushUndoEntry("バラエティ機種の差枚を修復", OVERALL_SUMMARY_KEY, overallSummaries);
+    const fixByDate = {};
+    fixCandidates.forEach((c) => {
+      if (!fixByDate[c.date]) fixByDate[c.date] = new Set();
+      fixByDate[c.date].add(c.rowIndex);
+    });
+    const deleteByDate = {};
+    deleteCandidates.forEach((c) => {
+      if (!deleteByDate[c.date]) deleteByDate[c.date] = new Set();
+      deleteByDate[c.date].add(c.rowIndex);
+    });
+    const nextSummaries = overallSummaries.map((s) => {
+      const rowIndicesToFix = fixByDate[s.date];
+      const rowIndicesToDelete = deleteByDate[s.date];
+      if (!rowIndicesToFix && !rowIndicesToDelete) return s;
+      const nextModelRows = s.modelRows
+        .filter((r, idx) => !(rowIndicesToDelete && rowIndicesToDelete.has(idx)))
+        .map((r, idx) => {
+          // re-filtering changes indices, so match on identity instead for the fix pass
+          const originalIdx = s.modelRows.indexOf(r);
+          if (rowIndicesToFix && rowIndicesToFix.has(originalIdx)) {
+            return { ...r, avgSada: r.avgGsu, avgGsu: null };
+          }
+          return r;
+        });
+      return { ...s, modelRows: nextModelRows };
+    });
+    persistOverallSummaries(nextSummaries);
+    setVarietyRepairPreview(null);
+    setVarietyRepairDone(true);
   }
 
   // export every piece of stored data as one JSON file — used for offline
@@ -5244,6 +5378,98 @@ export default function SlotDataTracker() {
                 </div>
               </div>
             </div>
+          {/* v6.9.14: one-time repair for the バラエティ misparse bug (v6.9.13) */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🛠 バラエティ機種の差枚を修復（v6.9.13より前のバグ対応）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              以前のバグで、民レポの「バラエティ（1台設置機種）」の行は台番号が差枚として、差枚がG数として保存されてしまっていました（G数自体は復元できません）。「勝率が読み取れなかった行」を目印に自動で候補を探し、内容を確認してから直せます。機種名では判定していないので、新台入れ替えでラインナップが変わっても対応できます。
+            </div>
+            <button
+              onClick={scanVarietyRepairCandidates}
+              style={{
+                background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3",
+                padding: "7px 12px", fontSize: "12px", cursor: "pointer", marginBottom: "10px",
+              }}
+            >
+              修復候補を探す
+            </button>
+            {varietyRepairDone && (
+              <div style={{ fontSize: "12px", color: "#9ece6a", marginBottom: "10px" }}>✓ 修復を反映しました。</div>
+            )}
+            {varietyRepairPreview && (
+              varietyRepairPreview.fixCandidates.length === 0 && varietyRepairPreview.deleteCandidates.length === 0 ? (
+                <div style={{ fontSize: "12px", color: "#5a6272" }}>修復・削除が必要そうな行は見つかりませんでした。</div>
+              ) : (
+                <>
+                  {varietyRepairPreview.fixCandidates.length > 0 && (
+                    <>
+                      <div style={{ fontSize: "12px", color: "#e8b34c", marginBottom: "8px" }}>
+                        {varietyRepairPreview.fixCandidates.length}件、差枚の修復候補が見つかりました（G数は空欄に戻ります）。
+                      </div>
+                      <div className="scrollbar" style={{ maxHeight: "220px", overflowY: "auto", marginBottom: "14px" }}>
+                        <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse" }}>
+                          <thead>
+                            <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                              <th style={{ padding: "3px 6px" }}>日付</th>
+                              <th style={{ padding: "3px 6px" }}>機種名</th>
+                              <th style={{ padding: "3px 6px" }}>今の平均差枚(実は台番号)</th>
+                              <th style={{ padding: "3px 6px" }}>→ 修復後の平均差枚</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {varietyRepairPreview.fixCandidates.map((c, i) => (
+                              <tr key={i} style={{ borderTop: "1px solid #1c2129" }}>
+                                <td style={{ padding: "3px 6px", color: "#8b93a3" }} className="mono">{c.date}</td>
+                                <td style={{ padding: "3px 6px", color: "#c7cbd4" }}>{c.name}</td>
+                                <td style={{ padding: "3px 6px", color: "#e5697a" }} className="mono">{c.oldAvgSada}</td>
+                                <td style={{ padding: "3px 6px", color: "#9ece6a" }} className="mono">{c.fixedAvgSada}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                  {varietyRepairPreview.deleteCandidates.length > 0 && (
+                    <>
+                      <div style={{ fontSize: "12px", color: "#e5697a", marginBottom: "8px" }}>
+                        {varietyRepairPreview.deleteCandidates.length}件、中身が空のゴミ行（見出し行とヘッダー行がくっついたもの）が見つかりました。復元できる数字が無いため削除します。
+                      </div>
+                      <div className="scrollbar" style={{ maxHeight: "160px", overflowY: "auto", marginBottom: "14px" }}>
+                        <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse" }}>
+                          <thead>
+                            <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                              <th style={{ padding: "3px 6px" }}>日付</th>
+                              <th style={{ padding: "3px 6px" }}>削除される行の名前</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {varietyRepairPreview.deleteCandidates.map((c, i) => (
+                              <tr key={i} style={{ borderTop: "1px solid #1c2129" }}>
+                                <td style={{ padding: "3px 6px", color: "#8b93a3" }} className="mono">{c.date}</td>
+                                <td style={{ padding: "3px 6px", color: "#e5697a" }}>{c.name}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                  <button
+                    onClick={applyVarietyRepair}
+                    style={{
+                      background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "6px",
+                      padding: "8px 14px", fontSize: "12px", fontWeight: 700, cursor: "pointer",
+                    }}
+                  >
+                    修復{varietyRepairPreview.fixCandidates.length}件・削除{varietyRepairPreview.deleteCandidates.length}件を反映する
+                  </button>
+                </>
+              )
+            )}
+          </div>
           {/* export everything for offline analysis / backtesting */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
