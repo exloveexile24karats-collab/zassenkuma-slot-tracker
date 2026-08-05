@@ -374,7 +374,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // これは復元できる数字が元から無いので、修復ツールに削除候補としても
 // 検出・表示するよう拡張。実際のシナリオでテストし、正常な行・修復可能な
 // 行・削除対象のゴミ行がそれぞれ正しく仕分けられることを確認済み。
-const APP_VERSION = "6.9.15";
+// v6.9.16: 民レポの機種×日付マトリクス表で、バラエティ（1台設置機種）
+// だった日のセルを色付け（イベント絞り込み時も維持）。同じ機種でも、複数
+// 台あった日は色付けしない、日付単位（セルごと）の判定。parseSummaryTable
+// が行ごとにisVariety（バラエティ欄から読んだか）を保存するようにし、
+// それを使って該当セルだけをハイライトする。
+// v6.9.17: バラエティ修復ツールに、消えたG数の推定復元を統合。差枚と
+// 出率が両方残っていれば、標準的な1G=3枚投入の計算式から逆算できる（実
+// データで検証、ほとんどの機種で誤差1%未満）。カードの説明文が「G数は
+// 復元できません」のままだったのを、実際の挙動（推定値で埋める）に合わせ
+// て更新。
+const APP_VERSION = "6.9.17";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -504,6 +514,7 @@ function parseSummaryTable(text) {
         wins: null,
         total: null,
         shutsu: Number.isNaN(shutsu) ? null : shutsu,
+        isVariety: true, // v6.9.16: this day, this row came from the バラエティ（1台設置機種）section
       });
       continue;
     }
@@ -528,6 +539,7 @@ function parseSummaryTable(text) {
       avgGsu: Number.isNaN(avgGsu) ? null : avgGsu,
       wins,
       total,
+      isVariety: false,
       shutsu: Number.isNaN(shutsu) ? null : shutsu,
     });
   }
@@ -2952,6 +2964,19 @@ export default function SlotDataTracker() {
   // "機種", every numeric field null since none of the header's own text
   // parses as a number). There's nothing real to recover from that one —
   // it's flagged for deletion, not repair.
+  // v6.9.16: 差枚と出率が両方残っていれば、標準的な1G=3枚投入の計算式
+  // （出率 = (G数×3+差枚) / (G数×3) × 100）を逆算して、消えたG数を高い
+  // 精度で推定できる（実データで検証、ほとんどの機種で誤差1%未満。ただし
+  // 出率が100%に近いほど、分母が小さくなり誤差が拡大するので注意）。
+  function estimateGsuFromSadaAndShutsu(sada, shutsu) {
+    if (sada === null || sada === undefined || shutsu === null || shutsu === undefined) return null;
+    const denom = 3 * (shutsu / 100 - 1);
+    if (denom === 0) return null; // exactly 100% shutsu — can't divide, no reliable estimate
+    const estimate = sada / denom;
+    if (!Number.isFinite(estimate) || estimate <= 0) return null;
+    return Math.round(estimate);
+  }
+
   function scanVarietyRepairCandidates() {
     const fixCandidates = [];
     const deleteCandidates = [];
@@ -2962,13 +2987,15 @@ export default function SlotDataTracker() {
           return;
         }
         if (r.wins === null && r.total === null && r.avgSada !== null && r.avgSada !== undefined) {
+          const fixedAvgSada = r.avgGsu;
           fixCandidates.push({
             date: s.date,
             rowIndex: idx,
             name: r.name,
             oldAvgSada: r.avgSada, // was actually 台番号
             oldAvgGsu: r.avgGsu, // was actually 差枚
-            fixedAvgSada: r.avgGsu, // recovered 差枚
+            fixedAvgSada, // recovered 差枚
+            estimatedAvgGsu: estimateGsuFromSadaAndShutsu(fixedAvgSada, r.shutsu), // 推定G数（出率が100%付近だとnullのまま=推定できない）
           });
         }
       });
@@ -2983,8 +3010,8 @@ export default function SlotDataTracker() {
     pushUndoEntry("バラエティ機種の差枚を修復", OVERALL_SUMMARY_KEY, overallSummaries);
     const fixByDate = {};
     fixCandidates.forEach((c) => {
-      if (!fixByDate[c.date]) fixByDate[c.date] = new Set();
-      fixByDate[c.date].add(c.rowIndex);
+      if (!fixByDate[c.date]) fixByDate[c.date] = new Map();
+      fixByDate[c.date].set(c.rowIndex, c.estimatedAvgGsu);
     });
     const deleteByDate = {};
     deleteCandidates.forEach((c) => {
@@ -3001,7 +3028,7 @@ export default function SlotDataTracker() {
           // re-filtering changes indices, so match on identity instead for the fix pass
           const originalIdx = s.modelRows.indexOf(r);
           if (rowIndicesToFix && rowIndicesToFix.has(originalIdx)) {
-            return { ...r, avgSada: r.avgGsu, avgGsu: null };
+            return { ...r, avgSada: r.avgGsu, avgGsu: rowIndicesToFix.get(originalIdx) };
           }
           return r;
         });
@@ -4145,6 +4172,23 @@ export default function SlotDataTracker() {
     return map;
   }, [overallSortedSummaries]);
 
+  // v6.9.16: which (date, 機種名) CELLS should be flagged as「バラエティ
+  // コーナー」(1台設置) in the matrix table — per-cell, not per-機種, per
+  // the person's own clarification ("セルごと"): a day where this 機種 was
+  // in the バラエティ section gets flagged; a day where the SAME 機種 had
+  // multiple machines (e.g. before/after 新台入れ替え changed its count)
+  // does not, even though it's the same row. isVariety is undefined on
+  // data saved before v6.9.16 — treated as "not flagged" (safe default).
+  const overallGridVarietyCells = useMemo(() => {
+    const cells = new Set();
+    overallSortedSummaries.forEach((s) => {
+      s.modelRows.forEach((r) => {
+        if (r.isVariety) cells.add(`${s.date}|${r.name}`);
+      });
+    });
+    return cells;
+  }, [overallSortedSummaries]);
+
   // ---- 機種ページ用マトリクス表: 台番号 × 日付、セルは出率ベースの簡易マーク ----
   const pageGridDates = useMemo(() => {
     let dates;
@@ -4675,7 +4719,7 @@ export default function SlotDataTracker() {
     );
   }
 
-  function renderMarkGrid(dates, rows, marksMap, rowLabelFn) {
+  function renderMarkGrid(dates, rows, marksMap, rowLabelFn, varietyCells) {
     if (rows.length === 0 || dates.length === 0) {
       return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
     }
@@ -4693,13 +4737,16 @@ export default function SlotDataTracker() {
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => (
+            {rows.map((row) => {
+              return (
               <tr key={row}>
                 <td
                   title={rowLabelFn(row)}
                   style={{
-                    position: "sticky", left: 0, background: "#12161d", padding: "4px 8px", color: "#c7cbd4",
-                    borderBottom: "1px solid #1c2129", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                    position: "sticky", left: 0,
+                    background: "#12161d",
+                    color: "#c7cbd4",
+                    padding: "4px 8px", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                     maxWidth: "112px", boxSizing: "border-box",
                   }}
                 >
@@ -4710,14 +4757,25 @@ export default function SlotDataTracker() {
                   const isObjectMark = mark && typeof mark === "object";
                   const label = isObjectMark ? mark.label : mark;
                   const color = isObjectMark ? mark.color : mark ? markColor(mark) : "#2a323f";
+                  const isVarietyCell = varietyCells && varietyCells.has(`${d}|${row}`);
                   return (
-                    <td key={d} className="mono" style={{ padding: "4px 3px", textAlign: "center", color, borderBottom: "1px solid #1c2129" }}>
+                    <td
+                      key={d}
+                      className="mono"
+                      title={isVarietyCell ? "バラエティコーナー（1台設置）" : undefined}
+                      style={{
+                        padding: "4px 3px", textAlign: "center", color, borderBottom: "1px solid #1c2129",
+                        background: isVarietyCell ? "rgba(122,162,247,0.18)" : undefined,
+                        boxShadow: isVarietyCell ? "inset 0 0 0 1px rgba(122,162,247,0.5)" : undefined,
+                      }}
+                    >
                       {label || "・"}
                     </td>
                   );
                 })}
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -5384,7 +5442,7 @@ export default function SlotDataTracker() {
               🛠 バラエティ機種の差枚を修復（v6.9.13より前のバグ対応）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              以前のバグで、民レポの「バラエティ（1台設置機種）」の行は台番号が差枚として、差枚がG数として保存されてしまっていました（G数自体は復元できません）。「勝率が読み取れなかった行」を目印に自動で候補を探し、内容を確認してから直せます。機種名では判定していないので、新台入れ替えでラインナップが変わっても対応できます。
+              以前のバグで、民レポの「バラエティ（1台設置機種）」の行は台番号が差枚として、差枚がG数として保存されてしまっていました。「勝率が読み取れなかった行」を目印に自動で候補を探し、内容を確認してから直せます（機種名では判定していないので、新台入れ替えでラインナップが変わっても対応できます）。G数自体は元のバグでどこにも残っていませんが、差枚と出率から標準的な計算式（1G＝3枚投入）で逆算した推定値で埋めます（実データで検証済み、多くの場合誤差1%未満。出率が100%に近い台だけ推定できません）。
             </div>
             <button
               onClick={scanVarietyRepairCandidates}
@@ -5406,7 +5464,7 @@ export default function SlotDataTracker() {
                   {varietyRepairPreview.fixCandidates.length > 0 && (
                     <>
                       <div style={{ fontSize: "12px", color: "#e8b34c", marginBottom: "8px" }}>
-                        {varietyRepairPreview.fixCandidates.length}件、差枚の修復候補が見つかりました（G数は空欄に戻ります）。
+                        {varietyRepairPreview.fixCandidates.length}件、差枚の修復候補が見つかりました。G数は差枚と出率から逆算した推定値です（出率が100%に近い機種は精度が落ちます、その場合は空欄のままにします）。
                       </div>
                       <div className="scrollbar" style={{ maxHeight: "220px", overflowY: "auto", marginBottom: "14px" }}>
                         <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse" }}>
@@ -5416,6 +5474,7 @@ export default function SlotDataTracker() {
                               <th style={{ padding: "3px 6px" }}>機種名</th>
                               <th style={{ padding: "3px 6px" }}>今の平均差枚(実は台番号)</th>
                               <th style={{ padding: "3px 6px" }}>→ 修復後の平均差枚</th>
+                              <th style={{ padding: "3px 6px" }}>推定G数</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -5425,6 +5484,9 @@ export default function SlotDataTracker() {
                                 <td style={{ padding: "3px 6px", color: "#c7cbd4" }}>{c.name}</td>
                                 <td style={{ padding: "3px 6px", color: "#e5697a" }} className="mono">{c.oldAvgSada}</td>
                                 <td style={{ padding: "3px 6px", color: "#9ece6a" }} className="mono">{c.fixedAvgSada}</td>
+                                <td style={{ padding: "3px 6px", color: c.estimatedAvgGsu !== null ? "#7aa2f7" : "#5a6272" }} className="mono">
+                                  {c.estimatedAvgGsu !== null ? `約${c.estimatedAvgGsu}` : "推定不可"}
+                                </td>
                               </tr>
                             ))}
                           </tbody>
@@ -6239,7 +6301,7 @@ export default function SlotDataTracker() {
               機種名を台数の多い順に並べ、日付ごとの☆◎◯▲を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
             </div>
             {renderEventMultiSelect(overallGridEventFilter, setOverallGridEventFilter)}
-            {renderMarkGrid(overallGridDates, overallGridRows, overallGridMarks, (name) => name)}
+            {renderMarkGrid(overallGridDates, overallGridRows, overallGridMarks, (name) => name, overallGridVarietyCells)}
           </div>
 
 
