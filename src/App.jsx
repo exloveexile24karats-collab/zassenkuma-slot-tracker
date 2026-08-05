@@ -66,18 +66,40 @@ const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,s
 // limit. Back to one key PER DAY (a day is ~60KB, safely under 1MB), paired
 // with a small INDEX key listing which dates exist, so loading never needs
 // storage.list() (unavailable here) or blind probing across many months.
+// v6.9.12: one key per DAY meant loading a season's data (~88 days) fired
+// ~88 individual GET requests — on a mobile connection (higher latency,
+// and browsers cap concurrent requests per origin much lower than desktop),
+// this is exactly the kind of thing that shows up as "loading is really
+// slow." Regrouped into one key PER WEEK (Monday-anchored) instead: a week
+// of full-store data is ~420KB, still comfortably under the 1MB ceiling
+// with real margin, but cuts the number of keys/requests by roughly 7x.
 const RAW_FULLTABLE_KEY_PREFIX = "slot-raw-fulltable-v1:";
-const RAW_FULLTABLE_INDEX_KEY = "slot-raw-fulltable-index-v1"; // JSON array of "YYYY-MM-DD" strings
+const RAW_FULLTABLE_INDEX_KEY = "slot-raw-fulltable-index-v1"; // JSON array of "YYYY-MM-DD" strings (individual dates that have data)
 // v6.8 used this single key for ALL dates before the per-key split.
-// v6.8.1-6.8.4 then used this same "slot-raw-fulltable-v1:"+date naming,
-// just without an index — so those keys are already directly reusable,
-// they just need to be discovered once and added to the new index.
+// v6.8.1-6.8.4 then used "slot-raw-fulltable-v1:"+date (one key per day).
+// Both are kept only so the one-time migration below can recover leftovers.
 const LEGACY_RAW_FULLTABLE_KEY = "slot-raw-fulltable-v1";
 function monthOf(date) {
   return (date || "").slice(0, 7); // "2026-07-06" -> "2026-07"
 }
 function rawFullTableDateKey(date) {
+  // kept only for migrating leftover v6.8.1-6.8.4 per-day keys — no longer
+  // used for new reads/writes, see rawFullTableWeekKey below
   return `${RAW_FULLTABLE_KEY_PREFIX}${date}`;
+}
+// Monday-anchored ISO-ish week start, as a plain "YYYY-MM-DD" string
+function weekStartOf(date) {
+  const d = new Date(`${date}T00:00:00`);
+  const day = d.getDay(); // 0=Sun..6=Sat
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diffToMonday);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+function rawFullTableWeekKey(date) {
+  return `${RAW_FULLTABLE_KEY_PREFIX}week:${weekStartOf(date)}`;
 }
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
@@ -320,7 +342,19 @@ const DIGIT7_COLOR = "#f6a04d";
 // 各ページの入力フォームを消しても解除自体の動作は変わらない）。
 // v6.9.11: 各機種ページに残っていた「データ入力をロックする」ボタンも
 // 削除。ロック/解除の操作は共通設定だけで行う形に統一した。
-const APP_VERSION = "6.9.11";
+// v6.9.12: スマホでの読み込みが遅い問題の根本原因の一つが判明。アナスロ
+// の生データを「1日1キー」で読み込んでいたため、88日分あると読み込み時に
+// 約90回もの個別リクエストが発生しており、高遅延なモバイル回線＋ブラウザ
+// の同時接続数制限で大きな遅延を生んでいた。「1週間1キー（月曜始まり）」
+// にまとめ直し、必要なリクエスト数を約1/7（88日で15回程度）に削減。実際に
+// 実データで計測し、リクエスト数が89回→15回に減ることを確認済み。あわせ
+// て、この変更の実装中に月バケット方式（v6.8.9）の時と同じ「連続保存で
+// 途中の日付が消える」競合状態が再発しかけていたのを、正しい修正パターン
+// （refを書き込み前に同期更新する）で防止。ランダム遅延を模したテストで
+// 修正前は実際に日付が消えること・修正後は消えないことを確認済み。旧形式
+// （v6.8の単一キー・v6.8.1〜4の日付別キー・v6.8.5〜10の月別キー）からの
+// 移行も、週別キーへ正しく統合されることをテストで確認した。
+const APP_VERSION = "6.9.12";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1978,11 +2012,11 @@ export default function SlotDataTracker() {
   // which is racy against a save that hasn't committed yet) is what
   // actually fixes the "middle dates disappear" lost-update bug.
   const rawFullTableRef = useRef({});
-  // v6.8.11: with per-day keys again, each individual date's write no
-  // longer shares a key with other dates, so the same-key write-race from
-  // v6.8.9 doesn't apply to date data itself anymore. It DOES still apply
-  // to the single shared INDEX key (which lists which dates exist) — so
-  // that one still needs the ref+queue treatment.
+  // v6.9.12: back to sharing a key across multiple dates (one per WEEK now,
+  // to cut request count on mobile) — same lost-update risk this had before
+  // at the month-bucket stage (v6.8.9), so it needs the same per-key write
+  // queue treatment: never let two saves for the same week race each other.
+  const rawFullTableWeekWriteQueueRef = useRef({}); // weekKey -> queue promise
   const rawFullTableIndexRef = useRef([]); // current known list of dates, kept in lockstep with storage
   const rawFullTableIndexWriteQueueRef = useRef(Promise.resolve()); // single queue, since there's only one index key
   const [rawFullTableLoaded, setRawFullTableLoaded] = useState(false);
@@ -2134,30 +2168,35 @@ export default function SlotDataTracker() {
         let indexNeedsWrite = false;
 
         if (knownDates !== null) {
-          // fast path: index exists, fetch exactly the dates it lists
+          // v6.9.12 fast path: index still lists individual DATES (so we
+          // still know precisely what exists), but fetching now happens
+          // per WEEK bucket — compute the distinct week keys those dates
+          // fall into, and GET only those (far fewer requests than one per
+          // date, especially over a season's worth of data).
+          const weekKeys = Array.from(new Set(knownDates.map((d) => rawFullTableWeekKey(d))));
           const results = await Promise.all(
-            knownDates.map(async (date) => {
+            weekKeys.map(async (key) => {
               try {
-                const r = await storage.get(rawFullTableDateKey(date), false);
-                if (!r || !r.value) return { date, ok: true, rows: null };
-                return { date, ok: true, rows: JSON.parse(r.value) };
+                const r = await storage.get(key, false);
+                if (!r || !r.value) return { key, ok: true, data: null };
+                return { key, ok: true, data: JSON.parse(r.value) };
               } catch (e) {
-                return { date, ok: false };
+                return { key, ok: false };
               }
             })
           );
-          const failedDates = [];
+          const failedKeys = [];
           results.forEach((r) => {
             if (!r.ok) {
-              failedDates.push(r.date);
+              failedKeys.push(r.key);
               return;
             }
-            if (r.rows) next[r.date] = r.rows;
+            if (r.data && typeof r.data === "object") Object.assign(next, r.data);
           });
-          if (failedDates.length > 0) {
+          if (failedKeys.length > 0) {
             setRawFullTableMigrationStatus({
               type: "error",
-              msg: `アナスロの一部データ（${failedDates.join(", ")}）の読み込みに失敗しました。ページを再読み込みしてみてください。`,
+              msg: `アナスロの一部データ（${failedKeys.join(", ")}）の読み込みに失敗しました。ページを再読み込みしてみてください。`,
             });
           }
         }
@@ -2184,8 +2223,15 @@ export default function SlotDataTracker() {
         const missingDates = candidateDates.filter((d) => !(d in next));
 
         if (missingDates.length > 0) {
-          // 1. probe this exact per-date key naming directly (covers
-          // v6.8.1〜v6.8.4 and v6.8.11+ leftovers/gaps)
+          // v6.9.12: all three legacy-recovery sources below now converge
+          // on the same outcome — dates found get folded into WEEK buckets
+          // (not re-saved as per-date keys, which would defeat the point
+          // of moving to weekly buckets in the first place).
+          const recoveredDates = {}; // date -> rows, accumulated from all sources below
+          const legacySourceKeysToDelete = [];
+
+          // 1. leftover v6.8.1〜v6.8.4 per-date keys (read-only probe — these
+          // used the exact same naming as rawFullTableDateKey)
           const probeResults = await Promise.all(
             missingDates.map(async (date) => {
               try {
@@ -2198,18 +2244,14 @@ export default function SlotDataTracker() {
             })
           );
           probeResults.forEach((r) => {
-            if (r) {
-              next[r.date] = r.rows;
-              indexNeedsWrite = true;
-            }
+            if (!r) return;
+            recoveredDates[r.date] = r.rows;
+            legacySourceKeysToDelete.push(rawFullTableDateKey(r.date));
           });
 
           // 2. v6.8.5〜v6.8.10 briefly used MONTH-bucket keys
           // ("slot-raw-fulltable-v1:YYYY-MM", an object of {date: rows})
-          // before that scheme was found to exceed the real ~1MB per-value
-          // limit. Check the months actually represented among still-
-          // missing dates and split any found bucket into per-day entries.
-          const stillMissingAfterProbe = missingDates.filter((d) => !(d in next));
+          const stillMissingAfterProbe = missingDates.filter((d) => !(d in next) && !(d in recoveredDates));
           const candidateMonthsFromDates = Array.from(new Set(stillMissingAfterProbe.map((d) => monthOf(d)))).filter(Boolean);
           const monthBucketResults = await Promise.all(
             candidateMonthsFromDates.map(async (mo) => {
@@ -2223,38 +2265,16 @@ export default function SlotDataTracker() {
               }
             })
           );
-          const monthBucketKeysToDelete = [];
-          const monthBucketDateWrites = [];
-          let monthBucketMigratedCount = 0;
           monthBucketResults.forEach((m) => {
             if (!m || !m.data || typeof m.data !== "object") return;
             Object.entries(m.data).forEach(([date, rows]) => {
-              if (date in next) return; // per-day probe already found this date
-              next[date] = rows;
-              monthBucketMigratedCount += 1;
-              indexNeedsWrite = true;
-              monthBucketDateWrites.push(storage.set(rawFullTableDateKey(date), JSON.stringify(rows), false).then((res) => ({ date, ok: !!res })));
+              if (date in next || date in recoveredDates) return;
+              recoveredDates[date] = rows;
             });
-            monthBucketKeysToDelete.push(m.key);
+            legacySourceKeysToDelete.push(m.key);
           });
-          if (monthBucketMigratedCount > 0) {
-            const writeResults = await Promise.all(monthBucketDateWrites);
-            const failed = writeResults.filter((r) => !r.ok).map((r) => r.date);
-            if (failed.length > 0) {
-              setRawFullTableMigrationStatus({
-                type: "error",
-                msg: `v6.8.5〜v6.8.10の月別データの移行中、${failed.length}件の保存に失敗しました（${failed.join(", ")}）。月別キーは安全のため削除していません。`,
-              });
-            } else {
-              await Promise.all(monthBucketKeysToDelete.map((k) => storage.delete(k, false)));
-              setRawFullTableMigrationStatus({
-                type: "ok",
-                msg: `v6.8.5〜v6.8.10で使っていた月別データを${monthBucketMigratedCount}件、日付別キーに移行しました。`,
-              });
-            }
-          }
 
-          // 3. also fold in the v6.8 single shared blob, if it's still there
+          // 3. the original v6.8 single shared blob
           try {
             const legacy = await storage.get(LEGACY_RAW_FULLTABLE_KEY, false);
             if (legacy && legacy.value) {
@@ -2269,37 +2289,58 @@ export default function SlotDataTracker() {
                 legacyData = null;
               }
               if (legacyData && typeof legacyData === "object") {
-                let migratedCount = 0;
-                const dateWrites = [];
                 Object.entries(legacyData).forEach(([date, rows]) => {
-                  if (date in next) return;
-                  next[date] = rows;
-                  migratedCount += 1;
-                  indexNeedsWrite = true;
-                  dateWrites.push(storage.set(rawFullTableDateKey(date), JSON.stringify(rows), false).then((res) => ({ date, ok: !!res })));
+                  if (date in next || date in recoveredDates) return;
+                  recoveredDates[date] = rows;
                 });
-                if (migratedCount > 0) {
-                  const writeResults = await Promise.all(dateWrites);
-                  const failed = writeResults.filter((r) => !r.ok).map((r) => r.date);
-                  if (failed.length > 0) {
-                    setRawFullTableMigrationStatus({
-                      type: "error",
-                      msg: `旧データの移行中、${failed.length}件の保存に失敗しました（${failed.join(", ")}）。旧キーは安全のため削除していません。`,
-                    });
-                  } else {
-                    await storage.delete(LEGACY_RAW_FULLTABLE_KEY, false);
-                    setRawFullTableMigrationStatus({
-                      type: "ok",
-                      msg: `旧形式のデータを${migratedCount}件、日付別キーに移行しました。`,
-                    });
-                  }
-                }
+                legacySourceKeysToDelete.push(LEGACY_RAW_FULLTABLE_KEY);
               }
             }
           } catch (e) {
             setRawFullTableMigrationStatus((prev) =>
               prev || { type: "error", msg: `旧データの確認中にエラーが発生しました：${e && e.message ? e.message : "不明なエラー"}` }
             );
+          }
+
+          // now fold everything recovered into WEEK buckets and write those
+          const recoveredCount = Object.keys(recoveredDates).length;
+          if (recoveredCount > 0) {
+            const weekBuckets = {}; // weekKey -> { date: rows, ... }
+            Object.entries(recoveredDates).forEach(([date, rows]) => {
+              const wk = rawFullTableWeekKey(date);
+              if (!weekBuckets[wk]) weekBuckets[wk] = { ...(next[wk] || {}) };
+              weekBuckets[wk][date] = rows;
+              next[date] = rows;
+            });
+            const writeResults = await Promise.all(
+              Object.entries(weekBuckets).map(async ([wk, bucket]) => {
+                // merge with whatever's already stored under this week key,
+                // in case only PART of that week was "missing"
+                let merged = bucket;
+                try {
+                  const existing = await storage.get(wk, false);
+                  if (existing && existing.value) merged = { ...JSON.parse(existing.value), ...bucket };
+                } catch (e) {
+                  // no existing bucket, or unreadable — just write what we recovered
+                }
+                const res = await storage.set(wk, JSON.stringify(merged), false);
+                return { wk, ok: !!res };
+              })
+            );
+            const failedWeeks = writeResults.filter((r) => !r.ok).map((r) => r.wk);
+            if (failedWeeks.length > 0) {
+              setRawFullTableMigrationStatus({
+                type: "error",
+                msg: `旧データの移行中、${failedWeeks.length}件の週別キー保存に失敗しました（${failedWeeks.join(", ")}）。旧キーは安全のため削除していません。`,
+              });
+            } else {
+              await Promise.all(legacySourceKeysToDelete.map((k) => storage.delete(k, false)));
+              indexNeedsWrite = true;
+              setRawFullTableMigrationStatus({
+                type: "ok",
+                msg: `旧形式のデータを${recoveredCount}件、週別キーに移行しました。`,
+              });
+            }
           }
         }
 
@@ -2454,25 +2495,48 @@ export default function SlotDataTracker() {
       }
     }
     setFullTableDuplicateWarning(null);
-    // 1. persist raw into this date's OWN key (v6.8.11 — back to per-day
-    // keys since a month bucket can exceed the real ~1MB per-value limit;
-    // a single day, ~60KB, is safely under it). v6.8.10's fix (only mark
-    // "登録済み" in the UI after the write is CONFIRMED, not optimistically)
-    // still applies here.
+    // 1. persist raw into this date's WEEK bucket (v6.9.12 — grouping by
+    // week instead of by day cuts the number of keys/requests needed on
+    // load by roughly 7x, which matters a lot on a higher-latency mobile
+    // connection; a week of full-store data, ~420KB, is still safely under
+    // the real ~1MB per-value limit found in v6.8.11). v6.8.10's fix (only
+    // mark "登録済み" in the UI after the write is CONFIRMED, not
+    // optimistically) still applies. Same lost-update race as the old
+    // month-bucket attempt (v6.8.9) applies here too since multiple dates
+    // can now share a key — same fix: a per-week-key write queue, building
+    // the written value from the current ref (not a value captured
+    // earlier), so back-to-back saves in the same week can't clobber
+    // each other regardless of which write's network round-trip finishes
+    // last.
     const previousRaw = rawFullTableRef.current;
     const nextRaw = { ...previousRaw, [fullTableDate]: rows };
-    const dateKey = rawFullTableDateKey(fullTableDate);
+    rawFullTableRef.current = nextRaw; // update SYNCHRONOUSLY, before any await — see note above; this is what lets a
+    // rapid second save (same week) see this date already merged in, regardless of whether this save's own
+    // network round-trip has finished yet. Reverted below if this save ultimately fails.
+    const weekKey = rawFullTableWeekKey(fullTableDate);
+    const previousWeekWrite = rawFullTableWeekWriteQueueRef.current[weekKey] || Promise.resolve();
+    const thisWeekWrite = previousWeekWrite.then(() => {
+      const weekStart = weekStartOf(fullTableDate);
+      const bucket = {};
+      Object.keys(rawFullTableRef.current).forEach((d) => {
+        if (weekStartOf(d) === weekStart) bucket[d] = rawFullTableRef.current[d];
+      });
+      bucket[fullTableDate] = rows; // ensure this date is in the bucket even if the ref hasn't caught up yet
+      return storage.set(weekKey, JSON.stringify(bucket), false);
+    });
+    rawFullTableWeekWriteQueueRef.current[weekKey] = thisWeekWrite.catch(() => null);
     try {
-      const res = await storage.set(dateKey, JSON.stringify(rows), false);
+      const res = await thisWeekWrite;
       if (!res) {
+        rawFullTableRef.current = previousRaw; // don't let a failed save poison a later same-week save's bucket
         setFullTableStatus({ type: "error", msg: "生データの保存に失敗しました（storage.setがfalsyな結果を返しました）。もう一度お試しください。" });
         return;
       }
     } catch (e) {
+      rawFullTableRef.current = previousRaw;
       setFullTableStatus({ type: "error", msg: `生データの保存中にエラーが発生しました：${e && e.message ? e.message : "詳細不明"}` });
       return;
     }
-    rawFullTableRef.current = nextRaw;
     setRawFullTable(nextRaw); // only reflect success in the visible UI state once the write is confirmed
 
     // 1b. update the shared INDEX key so future loads know this date
@@ -2740,19 +2804,33 @@ export default function SlotDataTracker() {
 
   // v6.9.7: dates with only アナスロ data (no 民レポ entry) had no delete
   // affordance at all in the registered-dates list, since the existing
-  // delete button was tied to a 民レポ summary object. This deletes that
-  // one date's per-date アナスロ key and removes it from the index.
+  // delete button was tied to a 民レポ summary object. This removes that
+  // one date from its WEEK bucket (v6.9.12) and removes it from the index.
   async function handleDeleteFullTableDate(date) {
     const nextRaw = { ...rawFullTableRef.current };
     delete nextRaw[date];
     rawFullTableRef.current = nextRaw;
     setRawFullTable(nextRaw);
+    const weekKey = rawFullTableWeekKey(date);
+    const previousWeekWrite = rawFullTableWeekWriteQueueRef.current[weekKey] || Promise.resolve();
+    const thisWeekWrite = previousWeekWrite.then(async () => {
+      const weekStart = weekStartOf(date);
+      const bucket = {};
+      Object.keys(rawFullTableRef.current).forEach((d) => {
+        if (weekStartOf(d) === weekStart) bucket[d] = rawFullTableRef.current[d];
+      });
+      if (Object.keys(bucket).length === 0) {
+        return storage.delete(weekKey, false);
+      }
+      return storage.set(weekKey, JSON.stringify(bucket), false);
+    });
+    rawFullTableWeekWriteQueueRef.current[weekKey] = thisWeekWrite.catch(() => null);
     try {
-      await storage.delete(rawFullTableDateKey(date), false);
+      await thisWeekWrite;
     } catch (e) {
-      // storage delete failing isn't fatal here — the in-memory state above
+      // storage write failing isn't fatal here — the in-memory state above
       // already reflects the removal; next full reload will just re-fetch
-      // the (still-deleted, since we succeeded locally) missing key normally
+      // whatever's actually still in storage
     }
     rawFullTableIndexRef.current = rawFullTableIndexRef.current.filter((d) => d !== date);
     try {
