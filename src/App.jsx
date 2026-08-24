@@ -384,7 +384,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // データで検証、ほとんどの機種で誤差1%未満）。カードの説明文が「G数は
 // 復元できません」のままだったのを、実際の挙動（推定値で埋める）に合わせ
 // て更新。
-const APP_VERSION = "6.9.17";
+// v6.9.18: 設定期待度スコアの信頼度の効かせ方を変更。以前は信頼度が低い
+// 時に50へ寄せていたが（プラザ2側のシステムと突き合わせて確認したところ）
+// これだと低信頼度の読みでも50前後の「そこそこ目立つ数字」に見えてしまう
+// ため、プラザ2方式（信頼度を掛け算して0に近づける）に統一。信頼度が低い
+// 時は数字自体が小さく・灰色っぽくなり、パッと見で「参考にならない」と
+// 分かるようにした。信頼度が高い時の見え方は変わらない。
+// v6.9.19: 「本日のピックアップ（実測パターン方式）」の見出しが紛らわしい
+// （実際に予想している対象は最新登録日の翌日）ため、プラザ2と同じく
+// 「8/13のピックアップ」のように予想対象日（月/日）を直接表示する見出しに
+// 変更。
+const APP_VERSION = "6.9.19";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -776,7 +786,13 @@ function settingLikelihoodScore(table, count, n) {
   const avgRate = table.reduce((a, t) => a + t.rate, 0) / table.length;
   const expectedEvents = n * avgRate;
   const confidence = Math.max(0, Math.min(1, expectedEvents / 25));
-  const normalized = 0.5 + (rawNormalized - 0.5) * confidence;
+  // v6.9.18: was `0.5 + (rawNormalized-0.5)*confidence` — low-confidence
+  // readings shrank toward 50, which on a 0-100 display still reads as a
+  // moderately eye-catching number rather than "we don't really know."
+  // Switched to プラザ2 style instead: multiply toward 0, so a low-G数
+  // reading looks visually unremarkable/low rather than sitting in the
+  // middle of the scale looking notable.
+  const normalized = rawNormalized * confidence;
   return { expectedSetting, normalized, confidence, sampleSize: n };
 }
 
@@ -6871,7 +6887,12 @@ export default function SlotDataTracker() {
             {symbolPickup ? (
               <>
                 <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-                  本日のピックアップ（実測パターン方式）
+                  {(() => {
+                    if (sortedHistory.length === 0) return "ピックアップ（実測パターン方式）";
+                    const targetDate = addDays(sortedHistory[sortedHistory.length - 1].date, 1);
+                    const [, m, d] = targetDate.split("-");
+                    return `${parseInt(m, 10)}/${parseInt(d, 10)}のピックアップ（実測パターン方式）`;
+                  })()}
                 </div>
                 <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
                   この機種自身の過去データから、「前日結果」「連続日数」「台番号の実績」「イベント・末尾一致」「直近の総差枚」などの組み合わせを実際に集計し、それぞれの実測差分をそのままポイント化して合計しています（全て「実測○○% vs 全体平均○○%」から直接計算、固定の重みではありません）。全体の☆〇（設定良さそう＋出玉が出ている）出現率は
