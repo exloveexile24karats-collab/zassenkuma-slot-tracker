@@ -394,7 +394,25 @@ const DIGIT7_COLOR = "#f6a04d";
 // （実際に予想している対象は最新登録日の翌日）ため、プラザ2と同じく
 // 「8/13のピックアップ」のように予想対象日（月/日）を直接表示する見出しに
 // 変更。
-const APP_VERSION = "6.9.19";
+// v6.9.20: 設定期待度の信頼度の基準を変更。以前は「期待発生回数（G数×
+// その台の理論発生率）÷25」という機種の理論値表に依存した基準だった
+// （モンキーターンだと信頼度100%に約6500G数が必要）。普段の遊技量（G数
+// 2000〜4000程度）だと軒並み信頼度が低く出てしまうという指摘を受け、
+// プラザ2と同じ考え方（G数だけを見るシンプルな線形ランプ）に変更。ただし
+// プラザ2の基準（8000）は総回転数ベースで、雑餉隈は通常時G数を使っている
+// ため数値が違って当然という点を確認した上で、通常時G数=5000で信頼度
+// 100%になるよう設定。
+// v6.9.21: 上記の5000を、実データ（モンキーターンV・100日分）で確認した
+// ところ中央値1,460・90%点でも3,912と、5,000を超えるのは上位1%程度だった
+// ため、90%点である3,900に引き下げ。この基準本来の目的（低G数でたまたま
+// 出玉が出た日を誤読しないよう弾くこと）に立ち返った調整。
+// v6.9.22: 台番号×日付マトリクス表（設定期待度）の表示形式をプラザ2と
+// 揃えた。大きい数字＝信頼度重みをかけた表示値、右下の小さい数字＝重み前
+// の元の値、という二段表示に変更（settingLikelihoodScoreがrawNormalized
+// を返すよう拡張し、pageGridMarksで両方保持）。プラザ2の▼マーク（低G数
+// なのに出率110%以上）と同じ趣旨で、雑餉隈側は出率を持っていないため
+// 差枚で代用（G数2000未満かつ差枚が機種平均+1500超）。
+const APP_VERSION = "6.9.22";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -783,9 +801,21 @@ function settingLikelihoodScore(table, count, n) {
   const maxS = Math.max(...settings);
   const expectedSetting = weights.reduce((a, w) => a + (w.w / totalW) * w.setting, 0);
   const rawNormalized = maxS > minS ? (expectedSetting - minS) / (maxS - minS) : 0.5;
-  const avgRate = table.reduce((a, t) => a + t.rate, 0) / table.length;
-  const expectedEvents = n * avgRate;
-  const confidence = Math.max(0, Math.min(1, expectedEvents / 25));
+  // v6.9.20: was `expectedEvents/25` (expectedEvents = G数 × その台の理論
+  // 発生率) — statistically principled, but rate-dependent, so different
+  // profiles reached confidence=1 at very different G数 (~6500 for
+  // モンキーターン's average rate). Switched to a flat G数-based ramp
+  // instead (プラザ2と同じ考え方だが、通常時G数を使っている雑餉隈側の
+  // 遊技量に合わせて基準を再設定 — プラザ2の8000は総回転数基準なので
+  // そのまま持ってこれない、という点を確認した上での数値)。
+  // v6.9.21: 最初5000に設定したが、実データ（モンキーターンV・100日分）
+  // を確認したところ、G数の中央値は1,460、90%点でも3,912、5,000を超える
+  // のは上位1%程度だった。この基準を作った本来の目的（低G数でたまたま
+  // 出玉が出ただけの日を、設定が入ってると誤読しないよう弾くこと）に立ち
+  // 返り、実データの90%点である3,900に引き下げ。かなりよく回った日で
+  // 信頼度100%になる、という位置づけ。
+  const GSU_CONFIDENCE_CAP = 3900;
+  const confidence = Math.max(0, Math.min(1, n / GSU_CONFIDENCE_CAP));
   // v6.9.18: was `0.5 + (rawNormalized-0.5)*confidence` — low-confidence
   // readings shrank toward 50, which on a 0-100 display still reads as a
   // moderately eye-catching number rather than "we don't really know."
@@ -793,7 +823,7 @@ function settingLikelihoodScore(table, count, n) {
   // reading looks visually unremarkable/low rather than sitting in the
   // middle of the scale looking notable.
   const normalized = rawNormalized * confidence;
-  return { expectedSetting, normalized, confidence, sampleSize: n };
+  return { expectedSetting, normalized, rawNormalized, confidence, sampleSize: n };
 }
 
 // combined per-machine 設定期待度 (0-1, higher = more likely a good setting),
@@ -845,6 +875,7 @@ function evaluateSettingLikelihood(officialModelName, observation) {
     }
     return {
       score: Math.max(0, Math.min(1, combined + strongEventBoost)),
+      rawScore: hitScore.rawNormalized,
       expectedSetting: hitScore.expectedSetting,
       sampleSize: gsuNormal,
       basis: "初当たり／RB確率＋出玉（信頼度スライド）",
@@ -860,9 +891,11 @@ function evaluateSettingLikelihood(officialModelName, observation) {
     // directly than the AT case — no extra shrinkage needed
     const parts = [combinedScore, rbScore].filter(Boolean);
     const score = parts.reduce((a, p) => a + p.normalized, 0) / parts.length;
+    const rawScore = parts.reduce((a, p) => a + p.rawNormalized, 0) / parts.length;
     const expectedSetting = parts.reduce((a, p) => a + p.expectedSetting, 0) / parts.length;
     return {
       score: Math.max(0, Math.min(1, score + strongEventBoost)),
+      rawScore,
       expectedSetting,
       sampleSize: gsuNormal,
       basis: "合成確率＋RB確率",
@@ -4286,7 +4319,14 @@ export default function SlotDataTracker() {
           return;
         }
         const pct = Math.round(result.score * 100);
-        map[no][entry.date] = { label: String(pct), color: settingScoreColor(result.score) };
+        const rawPct = Math.round((result.rawScore ?? result.score) * 100);
+        // v6.9.22: プラザ2と同じ「▼」の考え方 — 低G数なのにたまたま良い
+        // 出玉が出ただけ、という誤読を目立たせる目印。プラザ2は出率で
+        // 判定していたが、雑餉隈のページ側の生データには出率が無いため、
+        // 同じ趣旨で差枚を使う（G数<2000 かつ 差枚が機種平均+1500超、
+        // ☆判定と同じしきい値）。
+        const isLowGsuGood = (entry.gsu || 0) < 2000 && (entry.sada || 0) > modelAvgSada + 1500;
+        map[no][entry.date] = { label: String(pct), rawLabel: String(rawPct), color: settingScoreColor(result.score), gsu: entry.gsu, isLowGsuGood };
       });
     });
     return map;
@@ -4774,18 +4814,30 @@ export default function SlotDataTracker() {
                   const label = isObjectMark ? mark.label : mark;
                   const color = isObjectMark ? mark.color : mark ? markColor(mark) : "#2a323f";
                   const isVarietyCell = varietyCells && varietyCells.has(`${d}|${row}`);
+                  const hasRaw = isObjectMark && mark.rawLabel !== undefined;
+                  const titleText = hasRaw
+                    ? `表示値=${mark.label}　元の値=${mark.rawLabel}　G数=${mark.gsu !== null && mark.gsu !== undefined ? mark.gsu : "不明"}`
+                    : isVarietyCell ? "バラエティコーナー（1台設置）" : undefined;
                   return (
                     <td
                       key={d}
                       className="mono"
-                      title={isVarietyCell ? "バラエティコーナー（1台設置）" : undefined}
+                      title={titleText}
                       style={{
                         padding: "4px 3px", textAlign: "center", color, borderBottom: "1px solid #1c2129",
                         background: isVarietyCell ? "rgba(122,162,247,0.18)" : undefined,
                         boxShadow: isVarietyCell ? "inset 0 0 0 1px rgba(122,162,247,0.5)" : undefined,
                       }}
                     >
-                      {label || "・"}
+                      {hasRaw ? (
+                        label ? (
+                          <span style={{ display: "inline-flex", alignItems: "baseline", gap: "1px" }}>
+                            {mark.isLowGsuGood && <span style={{ fontSize: "8px", lineHeight: 1 }}>▼</span>}
+                            <span>{label}</span>
+                            <sub style={{ fontSize: "8px", color: "#5a6272" }}>{mark.rawLabel}</sub>
+                          </span>
+                        ) : "・"
+                      ) : (label || "・")}
                     </td>
                   );
                 })}
@@ -6527,7 +6579,7 @@ export default function SlotDataTracker() {
               📋 台番号×日付マトリクス表
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              このページの台番号ごとに、日付ごとの数値を一覧表示します。設定判別プロファイルが登録済みの機種（モンキーターンV・マイジャグラーV・東京喰種・甲鉄城のカバネリ）は設定期待度（0〜100、高いほど赤・低いほど灰色）を表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
+              このページの台番号ごとに、日付ごとの数値を一覧表示します。設定判別プロファイルが登録済みの機種（モンキーターンV・マイジャグラーV・東京喰種・甲鉄城のカバネリ）は設定期待度（0〜100、高いほど赤・低いほど灰色）を表示します。大きい数字はG数（回転数）による信頼度重みをかけた表示値、右下の小さい数字は重み前の元の値です。<span style={{ color: "#e8b34c" }}>▼</span>は「G数2000未満なのに大きくプラス」の目立つセルの目印です。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
               <br />
               ⚠️ この数値はあくまで参考の目安です。実際の設定を保証するものではありません。
             </div>
