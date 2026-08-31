@@ -454,7 +454,16 @@ const DIGIT7_COLOR = "#f6a04d";
 // 111.1%）で、修正前はnull・修正後は正しく「☆」になることを確認済み。
 // あわせて、文字と重なって見づらい・意味が伝わりにくいと指摘のあった
 // 「1台構成」の青いドット表示は削除（ホバー時のツールチップでのみ案内）。
-const APP_VERSION = "6.9.27";
+// v6.9.28: 「台数が少ない」の本当の原因を発見・修正。機種×日付マトリクス
+// 表の行一覧（overallGridRows）が、r.total（設置台数）を持つ機種だけに
+// 絞り込まれていた。バラエティ（1台設置）機種は構造上r.totalが無い（1台
+// しかないので「台数」という概念が無い）ため、実データで29機種前後ある
+// バラエティ機種が、表の候補にすら入らず丸ごと消えていた。日数ベースの
+// フォールバックを追加し、全機種が正しく行に含まれるよう修正（実データで
+// 総行数を確認、修正で87行に）。あわせて、店舗全体の合計差枚を計算する
+// dailyStoreTotalsでも同じ理由でバラエティ機種の台数分（1台）が計算から
+// 漏れていたのを、isVarietyなら1台として数えるよう修正。
+const APP_VERSION = "6.9.28";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4237,10 +4246,17 @@ export default function SlotDataTracker() {
         let totalGsuWeighted = 0;
         let machineCount = 0;
         s.modelRows.forEach((r) => {
-          if (r.total && r.avgSada !== null && r.avgSada !== undefined && r.avgGsu !== null && r.avgGsu !== undefined) {
-            totalSamai += r.avgSada * r.total;
-            totalGsuWeighted += r.avgGsu * r.total;
-            machineCount += r.total;
+          // v6.9.28: r.total is structurally null for バラエティ（1台設置）
+          // rows (no unit-count concept for a single machine) — but they
+          // ARE 1 real physical unit, so excluding them entirely here
+          // undercounted the store-wide total by omitting every
+          // single-unit machine's contribution. Treat isVariety rows as
+          // exactly 1 unit for this weighting.
+          const effectiveTotal = r.total || (r.isVariety ? 1 : 0);
+          if (effectiveTotal && r.avgSada !== null && r.avgSada !== undefined && r.avgGsu !== null && r.avgGsu !== undefined) {
+            totalSamai += r.avgSada * effectiveTotal;
+            totalGsuWeighted += r.avgGsu * effectiveTotal;
+            machineCount += effectiveTotal;
           }
         });
         const names = splitEventNames(s.event);
@@ -4318,13 +4334,29 @@ export default function SlotDataTracker() {
   }, [overallSortedSummaries, overallGridEventFilter]);
 
   const overallGridRows = useMemo(() => {
+    // v6.9.28: this used to only include names that EVER had a truthy
+    // `total` (unit count) — but バラエティ（1台設置）rows structurally
+    // never have `total` (there's no unit-count concept for a single
+    // machine), so every バラエティ-only 機種 was silently excluded from
+    // the row list entirely, regardless of how much real data it had.
+    // Now includes any name seen at all, ranked by max unit count when
+    // known, falling back to number of days present for names that were
+    // always single-unit (so they still show up, just sorted after the
+    // genuinely multi-unit machines).
     const totalByName = {};
+    const daysByName = {};
     overallSortedSummaries.forEach((s) => {
       s.modelRows.forEach((r) => {
+        if (!r.name) return;
+        daysByName[r.name] = (daysByName[r.name] || 0) + 1;
         if (r.total) totalByName[r.name] = Math.max(totalByName[r.name] || 0, r.total);
       });
     });
-    return Object.keys(totalByName).sort((a, b) => (totalByName[b] || 0) - (totalByName[a] || 0));
+    return Object.keys(daysByName).sort((a, b) => {
+      const totalDiff = (totalByName[b] || 0) - (totalByName[a] || 0);
+      if (totalDiff !== 0) return totalDiff;
+      return (daysByName[b] || 0) - (daysByName[a] || 0);
+    });
   }, [overallSortedSummaries]);
 
   const overallGridMarks = useMemo(() => {
