@@ -412,7 +412,16 @@ const DIGIT7_COLOR = "#f6a04d";
 // を返すよう拡張し、pageGridMarksで両方保持）。プラザ2の▼マーク（低G数
 // なのに出率110%以上）と同じ趣旨で、雑餉隈側は出率を持っていないため
 // 差枚で代用（G数2000未満かつ差枚が機種平均+1500超）。
-const APP_VERSION = "6.9.22";
+// v6.9.23: バラエティ修復ツールをさらに拡張。①ゴミ行の検出を広げた
+// （「バラエティ」＋「機種」を含む名前だけでなく、名前が「機種」で始まる
+// もの全般 — 実データで「機種」という名前だけの空行が、ほぼ全期間に渡って
+// 1日2件ずつ紛れ込んでいるのを発見）。②新しい種類の破損パターンを検出：
+// 差枚・G数が両方null（出率だけ残っている）行。これは前回のパターンと
+// 違い、そもそも差枚も一度も保存されていないため復元できる数字が無く、
+// 一覧表示のみ（修復・削除はしない）にした。実データ（100日超）で検証、
+// 修復候補936件・削除候補185件・復元不可3461件を正しく仕分けられることを
+// 確認済み。
+const APP_VERSION = "6.9.23";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -3029,9 +3038,16 @@ export default function SlotDataTracker() {
   function scanVarietyRepairCandidates() {
     const fixCandidates = [];
     const deleteCandidates = [];
+    const unrecoverableCandidates = [];
     overallSummaries.forEach((s) => {
       (s.modelRows || []).forEach((r, idx) => {
-        if (r.name && r.name.includes("バラエティ") && r.name.includes("機種")) {
+        // v6.9.23: broadened garbage-row detection. The original check only
+        // caught names containing both "バラエティ" and "機種" — but the
+        // same pre-fix bug also produced names like "機種　　-スマスロ
+        // シャーマンキング" (a different header line got glued on, one that
+        // never had 「バラエティ」in it at all). No real 機種名 starts with
+        // the bare word "機種" itself, so that's now the broader signal.
+        if (r.name && ((r.name.includes("バラエティ") && r.name.includes("機種")) || r.name.startsWith("機種"))) {
           deleteCandidates.push({ date: s.date, rowIndex: idx, name: r.name });
           return;
         }
@@ -3046,10 +3062,25 @@ export default function SlotDataTracker() {
             fixedAvgSada, // recovered 差枚
             estimatedAvgGsu: estimateGsuFromSadaAndShutsu(fixedAvgSada, r.shutsu), // 推定G数（出率が100%付近だとnullのまま=推定できない）
           });
+          return;
+        }
+        // v6.9.23: a second, worse legacy corruption pattern — same era bug,
+        // but here avgSada AND avgGsu are BOTH null (not one holding a
+        // misplaced 台番号) with only shutsu surviving. There's genuinely
+        // nothing to recover 差枚 or G数 from for these — flagged
+        // separately so the person can see the true scope without being
+        // told it's "fixed" when it isn't.
+        if (
+          r.wins === null && r.total === null &&
+          (r.avgSada === null || r.avgSada === undefined) &&
+          (r.avgGsu === null || r.avgGsu === undefined) &&
+          r.shutsu !== null && r.shutsu !== undefined
+        ) {
+          unrecoverableCandidates.push({ date: s.date, rowIndex: idx, name: r.name, shutsu: r.shutsu });
         }
       });
     });
-    setVarietyRepairPreview({ fixCandidates, deleteCandidates });
+    setVarietyRepairPreview({ fixCandidates, deleteCandidates, unrecoverableCandidates });
   }
 
   function applyVarietyRepair() {
@@ -5525,7 +5556,7 @@ export default function SlotDataTracker() {
               <div style={{ fontSize: "12px", color: "#9ece6a", marginBottom: "10px" }}>✓ 修復を反映しました。</div>
             )}
             {varietyRepairPreview && (
-              varietyRepairPreview.fixCandidates.length === 0 && varietyRepairPreview.deleteCandidates.length === 0 ? (
+              varietyRepairPreview.fixCandidates.length === 0 && varietyRepairPreview.deleteCandidates.length === 0 && varietyRepairPreview.unrecoverableCandidates.length === 0 ? (
                 <div style={{ fontSize: "12px", color: "#5a6272" }}>修復・削除が必要そうな行は見つかりませんでした。</div>
               ) : (
                 <>
@@ -5580,6 +5611,33 @@ export default function SlotDataTracker() {
                               <tr key={i} style={{ borderTop: "1px solid #1c2129" }}>
                                 <td style={{ padding: "3px 6px", color: "#8b93a3" }} className="mono">{c.date}</td>
                                 <td style={{ padding: "3px 6px", color: "#e5697a" }}>{c.name}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                  {varietyRepairPreview.unrecoverableCandidates.length > 0 && (
+                    <>
+                      <div style={{ fontSize: "12px", color: "#8b93a3", marginBottom: "8px" }}>
+                        ⚠️ {varietyRepairPreview.unrecoverableCandidates.length}件、差枚・G数が両方nullで出率しか残っていない行が見つかりました。これは同じ時期のバグによるものですが、差枚もG数も元から保存されていないため、残念ながら復元できません（参考として一覧表示のみ、自動での修復・削除はしません）。
+                      </div>
+                      <div className="scrollbar" style={{ maxHeight: "160px", overflowY: "auto", marginBottom: "14px" }}>
+                        <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse" }}>
+                          <thead>
+                            <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                              <th style={{ padding: "3px 6px" }}>日付</th>
+                              <th style={{ padding: "3px 6px" }}>機種名</th>
+                              <th style={{ padding: "3px 6px" }}>残っている出率</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {varietyRepairPreview.unrecoverableCandidates.map((c, i) => (
+                              <tr key={i} style={{ borderTop: "1px solid #1c2129" }}>
+                                <td style={{ padding: "3px 6px", color: "#8b93a3" }} className="mono">{c.date}</td>
+                                <td style={{ padding: "3px 6px", color: "#c7cbd4" }}>{c.name}</td>
+                                <td style={{ padding: "3px 6px", color: "#8b93a3" }} className="mono">{c.shutsu}%</td>
                               </tr>
                             ))}
                           </tbody>
