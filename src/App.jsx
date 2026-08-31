@@ -432,7 +432,12 @@ const DIGIT7_COLOR = "#f6a04d";
 // 再び対象にならないようにした。あわせて、このバグで既に壊れてしまった
 // 可能性のある行（絶対値が10万を超える異常値）を検出して空欄に戻す「リ
 // セット」機能も追加。
-const APP_VERSION = "6.9.24";
+// v6.9.25: 機種×日付マトリクス表の「バラエティコーナー」ハイライトを、
+// 背景色＋枠線の塗りつぶしから、右上の小さいドット1つだけに変更。連続した
+// 日が続くと、隣同士の枠線がつながって中の▲〇マークが見えない「ベタ塗り
+// の青い塊」に見えてしまっていたのが原因。新しく入力したデータでも同じ
+// 現象が起きると指摘を受け、見た目自体を作り直した。
+const APP_VERSION = "6.9.25";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4911,11 +4916,18 @@ export default function SlotDataTracker() {
                       className="mono"
                       title={titleText}
                       style={{
+                        position: "relative",
                         padding: "4px 3px", textAlign: "center", color, borderBottom: "1px solid #1c2129",
-                        background: isVarietyCell ? "rgba(122,162,247,0.18)" : undefined,
-                        boxShadow: isVarietyCell ? "inset 0 0 0 1px rgba(122,162,247,0.5)" : undefined,
                       }}
                     >
+                      {isVarietyCell && (
+                        <span
+                          style={{
+                            position: "absolute", top: "1px", right: "1px", width: "4px", height: "4px",
+                            borderRadius: "50%", background: "#7aa2f7",
+                          }}
+                        />
+                      )}
                       {hasRaw ? (
                         label ? (
                           <span style={{ display: "inline-flex", alignItems: "baseline", gap: "1px" }}>
