@@ -421,7 +421,18 @@ const DIGIT7_COLOR = "#f6a04d";
 // 一覧表示のみ（修復・削除はしない）にした。実データ（100日超）で検証、
 // 修復候補936件・削除候補185件・復元不可3461件を正しく仕分けられることを
 // 確認済み。
-const APP_VERSION = "6.9.23";
+// v6.9.24: バラエティ修復ツールで、億〜兆単位のありえない数字が出てくる
+// 重大なバグを2つ修正。①推定G数の計算式で、出率がちょうど100%の時しか
+// ガードしておらず、100%に近い（100.01%等）だけでも分母がほぼゼロになり
+// 数字が爆発していた→誤差を許容する範囲でガードし直した。②もっと深刻
+// だったのは、一度修復した行がwins/totalを埋めない仕様のため、次にスキャ
+// ンした時にまた「修復候補」として引っかかり続け、繰り返すたびに数字が
+// 悪化する仕組みになっていた→修復対象の判定に「avgSadaが実在する台番号
+// らしい範囲（1〜999の整数）」という条件を追加し、既に修復済みの行が
+// 再び対象にならないようにした。あわせて、このバグで既に壊れてしまった
+// 可能性のある行（絶対値が10万を超える異常値）を検出して空欄に戻す「リ
+// セット」機能も追加。
+const APP_VERSION = "6.9.24";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -3029,9 +3040,15 @@ export default function SlotDataTracker() {
   function estimateGsuFromSadaAndShutsu(sada, shutsu) {
     if (sada === null || sada === undefined || shutsu === null || shutsu === undefined) return null;
     const denom = 3 * (shutsu / 100 - 1);
-    if (denom === 0) return null; // exactly 100% shutsu — can't divide, no reliable estimate
+    // v6.9.24: was `denom === 0` — only caught EXACTLY 100.0% shutsu. When
+    // shutsu is merely close to 100% (e.g. 100.01%), denom is a tiny but
+    // nonzero number, and dividing by it produces an enormous (but
+    // technically finite) estimate — this is what produced the absurd
+    // billion/trillion-scale "推定G数" values. Use a proper epsilon instead
+    // of an exact-zero check.
+    if (Math.abs(denom) < 0.003) return null; // roughly shutsu within ~0.1% of 100%
     const estimate = sada / denom;
-    if (!Number.isFinite(estimate) || estimate <= 0) return null;
+    if (!Number.isFinite(estimate) || estimate <= 0 || estimate > 50000) return null; // sanity bound — no real day has 50,000+ G数
     return Math.round(estimate);
   }
 
@@ -3039,6 +3056,7 @@ export default function SlotDataTracker() {
     const fixCandidates = [];
     const deleteCandidates = [];
     const unrecoverableCandidates = [];
+    const resetCandidates = [];
     overallSummaries.forEach((s) => {
       (s.modelRows || []).forEach((r, idx) => {
         // v6.9.23: broadened garbage-row detection. The original check only
@@ -3051,7 +3069,20 @@ export default function SlotDataTracker() {
           deleteCandidates.push({ date: s.date, rowIndex: idx, name: r.name });
           return;
         }
-        if (r.wins === null && r.total === null && r.avgSada !== null && r.avgSada !== undefined) {
+        // v6.9.24: added `r.avgSada is 1〜999` as a required condition. This
+        // was the actual root cause of the absurd numbers reported — a row
+        // that had ALREADY been through this repair once (avgSada now holds
+        // the real 差枚, avgGsu now holds an estimated G数) still has
+        // wins===null && total===null (repair never touches those fields),
+        // so without this bound it matched the SAME "fix candidate" rule
+        // again on every future scan. Re-"fixing" an already-fixed row
+        // swaps a real 差枚 back out and treats a G数 estimate as if it
+        // were a misplaced 台番号 — repeating this compounds the error each
+        // time. A genuine misplaced 台番号 is always a small integer (this
+        // page's 台番号 range), so bounding avgSada to a plausible 台番号
+        // shape makes already-repaired rows fall through instead of
+        // matching again.
+        if (r.wins === null && r.total === null && r.avgSada !== null && r.avgSada !== undefined && r.avgSada >= 1 && r.avgSada <= 999 && Number.isInteger(r.avgSada)) {
           const fixedAvgSada = r.avgGsu;
           fixCandidates.push({
             date: s.date,
@@ -3077,16 +3108,29 @@ export default function SlotDataTracker() {
           r.shutsu !== null && r.shutsu !== undefined
         ) {
           unrecoverableCandidates.push({ date: s.date, rowIndex: idx, name: r.name, shutsu: r.shutsu });
+          return;
+        }
+        // v6.9.24: catches rows already corrupted BY the compounding bug
+        // above (before this fix, an already-repaired row could get
+        // "re-fixed" repeatedly, each time swapping in the previous G数
+        // ESTIMATE as if it were a real 差枚/台番号 — producing absurd
+        // billion/trillion-scale values). No real day has anywhere near
+        // this much 差枚 or G数, so a simple magnitude bound catches it.
+        // These can't be un-corrupted (the real original 差枚 is gone,
+        // overwritten by estimates), so they're offered for reset to null
+        // rather than a further "fix."
+        if ((r.avgSada !== null && Math.abs(r.avgSada) > 100000) || (r.avgGsu !== null && Math.abs(r.avgGsu) > 100000)) {
+          resetCandidates.push({ date: s.date, rowIndex: idx, name: r.name, avgSada: r.avgSada, avgGsu: r.avgGsu });
         }
       });
     });
-    setVarietyRepairPreview({ fixCandidates, deleteCandidates, unrecoverableCandidates });
+    setVarietyRepairPreview({ fixCandidates, deleteCandidates, unrecoverableCandidates, resetCandidates });
   }
 
   function applyVarietyRepair() {
     if (!varietyRepairPreview) return;
-    const { fixCandidates, deleteCandidates } = varietyRepairPreview;
-    if (fixCandidates.length === 0 && deleteCandidates.length === 0) return;
+    const { fixCandidates, deleteCandidates, resetCandidates } = varietyRepairPreview;
+    if (fixCandidates.length === 0 && deleteCandidates.length === 0 && (!resetCandidates || resetCandidates.length === 0)) return;
     pushUndoEntry("バラエティ機種の差枚を修復", OVERALL_SUMMARY_KEY, overallSummaries);
     const fixByDate = {};
     fixCandidates.forEach((c) => {
@@ -3098,10 +3142,16 @@ export default function SlotDataTracker() {
       if (!deleteByDate[c.date]) deleteByDate[c.date] = new Set();
       deleteByDate[c.date].add(c.rowIndex);
     });
+    const resetByDate = {};
+    (resetCandidates || []).forEach((c) => {
+      if (!resetByDate[c.date]) resetByDate[c.date] = new Set();
+      resetByDate[c.date].add(c.rowIndex);
+    });
     const nextSummaries = overallSummaries.map((s) => {
       const rowIndicesToFix = fixByDate[s.date];
       const rowIndicesToDelete = deleteByDate[s.date];
-      if (!rowIndicesToFix && !rowIndicesToDelete) return s;
+      const rowIndicesToReset = resetByDate[s.date];
+      if (!rowIndicesToFix && !rowIndicesToDelete && !rowIndicesToReset) return s;
       const nextModelRows = s.modelRows
         .filter((r, idx) => !(rowIndicesToDelete && rowIndicesToDelete.has(idx)))
         .map((r, idx) => {
@@ -3109,6 +3159,12 @@ export default function SlotDataTracker() {
           const originalIdx = s.modelRows.indexOf(r);
           if (rowIndicesToFix && rowIndicesToFix.has(originalIdx)) {
             return { ...r, avgSada: r.avgGsu, avgGsu: rowIndicesToFix.get(originalIdx) };
+          }
+          if (rowIndicesToReset && rowIndicesToReset.has(originalIdx)) {
+            // v6.9.24: the real original 差枚 for these was already
+            // overwritten by a runaway estimate — nothing left to recover,
+            // so just null both out rather than keep compounding
+            return { ...r, avgSada: null, avgGsu: null };
           }
           return r;
         });
@@ -5556,7 +5612,7 @@ export default function SlotDataTracker() {
               <div style={{ fontSize: "12px", color: "#9ece6a", marginBottom: "10px" }}>✓ 修復を反映しました。</div>
             )}
             {varietyRepairPreview && (
-              varietyRepairPreview.fixCandidates.length === 0 && varietyRepairPreview.deleteCandidates.length === 0 && varietyRepairPreview.unrecoverableCandidates.length === 0 ? (
+              varietyRepairPreview.fixCandidates.length === 0 && varietyRepairPreview.deleteCandidates.length === 0 && varietyRepairPreview.unrecoverableCandidates.length === 0 && (!varietyRepairPreview.resetCandidates || varietyRepairPreview.resetCandidates.length === 0) ? (
                 <div style={{ fontSize: "12px", color: "#5a6272" }}>修復・削除が必要そうな行は見つかりませんでした。</div>
               ) : (
                 <>
@@ -5645,6 +5701,35 @@ export default function SlotDataTracker() {
                       </div>
                     </>
                   )}
+                  {varietyRepairPreview.resetCandidates && varietyRepairPreview.resetCandidates.length > 0 && (
+                    <>
+                      <div style={{ fontSize: "12px", color: "#e5697a", marginBottom: "8px" }}>
+                        🚨 {varietyRepairPreview.resetCandidates.length}件、以前のバグ（出率が100%付近の時にG数の逆算が異常な値になっていた）で、億〜兆単位のありえない数字が保存されてしまっている行が見つかりました。元の差枚はもう残っていないため、これらは空欄に戻します。
+                      </div>
+                      <div className="scrollbar" style={{ maxHeight: "160px", overflowY: "auto", marginBottom: "14px" }}>
+                        <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse" }}>
+                          <thead>
+                            <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                              <th style={{ padding: "3px 6px" }}>日付</th>
+                              <th style={{ padding: "3px 6px" }}>機種名</th>
+                              <th style={{ padding: "3px 6px" }}>今の値（異常）</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {varietyRepairPreview.resetCandidates.map((c, i) => (
+                              <tr key={i} style={{ borderTop: "1px solid #1c2129" }}>
+                                <td style={{ padding: "3px 6px", color: "#8b93a3" }} className="mono">{c.date}</td>
+                                <td style={{ padding: "3px 6px", color: "#c7cbd4" }}>{c.name}</td>
+                                <td style={{ padding: "3px 6px", color: "#e5697a" }} className="mono">
+                                  {c.avgSada}{c.avgSada !== null && c.avgGsu !== null ? " / " : ""}{c.avgGsu}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
                   <button
                     onClick={applyVarietyRepair}
                     style={{
@@ -5652,7 +5737,7 @@ export default function SlotDataTracker() {
                       padding: "8px 14px", fontSize: "12px", fontWeight: 700, cursor: "pointer",
                     }}
                   >
-                    修復{varietyRepairPreview.fixCandidates.length}件・削除{varietyRepairPreview.deleteCandidates.length}件を反映する
+                    修復{varietyRepairPreview.fixCandidates.length}件・削除{varietyRepairPreview.deleteCandidates.length}件・リセット{(varietyRepairPreview.resetCandidates || []).length}件を反映する
                   </button>
                 </>
               )
