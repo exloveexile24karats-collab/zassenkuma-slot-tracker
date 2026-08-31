@@ -444,7 +444,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // 構成、7月頭あたりから1台構成に切り替わっていた（台移動によるものと
 // 思われる）。表現を「この日、店内で1台構成でした（理由は問わない）」に
 // 変更。
-const APP_VERSION = "6.9.26";
+// v6.9.27: 「台が無くなったみたいに見える」の本当の原因を発見・修正。
+// 機種×日付マトリクス表のマーク（☆◎◯▲）を計算するclassifyMinRepoMark
+// 関数が、勝率（wins/total）を必須にしていた。バラエティ（1台設置）の行
+// は構造上「勝率」という概念自体が無い（1台しかないので）ため、実際には
+// 差枚・出率が正しく入っているのに、必ずマーク無し（空欄）になっていた。
+// 1台構成の日は「その台自身がプラスだったか」を勝率1件分の代わりとして
+// 使うよう修正。実データ（8/22の沖ドキ!DUOアンコール、+2604枚・出率
+// 111.1%）で、修正前はnull・修正後は正しく「☆」になることを確認済み。
+// あわせて、文字と重なって見づらい・意味が伝わりにくいと指摘のあった
+// 「1台構成」の青いドット表示は削除（ホバー時のツールチップでのみ案内）。
+const APP_VERSION = "6.9.27";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -487,10 +497,18 @@ function fmtNum(v) {
 // ◯ = 出率105%以上 & 勝率80%以上　▲ = 出率110%以上
 // condition: 2台以上設置 かつ 平均G数3000以上
 function classifyMinRepoMark(row) {
-  if (!row.total || row.total < 2) return null;
+  // v6.9.27: バラエティ（1台設置機種）の行は構造上 wins/total が無い（勝率
+  // という概念自体が無い、1台しかないので）。今までは総来（!row.total）で
+  // 弾かれ、必ず空欄マークになっていた — 実際にはavgSada・shutsuは正しく
+  // 入っているのに、機種が消えたように見えてしまっていた原因。1台構成の
+  // 日は「その台自身がプラスだったか」を勝率1件分の代わりとして使う。
+  const isSingleUnit = (row.total === null || row.total === undefined) && row.isVariety;
+  const effectiveWins = isSingleUnit ? (row.avgSada !== null && row.avgSada > 0 ? 1 : 0) : row.wins;
+  const effectiveTotal = isSingleUnit ? 1 : row.total;
+  if (!effectiveTotal || effectiveTotal < (isSingleUnit ? 1 : 2)) return null;
   if (row.avgGsu === null || row.avgGsu === undefined || row.avgGsu < 3000) return null;
   if (row.shutsu === null || row.shutsu === undefined) return null;
-  const winRate = row.wins !== null && row.wins !== undefined && row.total ? row.wins / row.total : null;
+  const winRate = effectiveWins !== null && effectiveWins !== undefined && effectiveTotal ? effectiveWins / effectiveTotal : null;
   if (winRate === null) return null;
   if (row.shutsu >= 110 && winRate >= 1) return "☆";
   if (row.shutsu >= 110 && winRate >= 0.8) return "◎";
@@ -4923,18 +4941,9 @@ export default function SlotDataTracker() {
                       className="mono"
                       title={titleText}
                       style={{
-                        position: "relative",
                         padding: "4px 3px", textAlign: "center", color, borderBottom: "1px solid #1c2129",
                       }}
                     >
-                      {isVarietyCell && (
-                        <span
-                          style={{
-                            position: "absolute", top: "1px", right: "1px", width: "4px", height: "4px",
-                            borderRadius: "50%", background: "#7aa2f7",
-                          }}
-                        />
-                      )}
                       {hasRaw ? (
                         label ? (
                           <span style={{ display: "inline-flex", alignItems: "baseline", gap: "1px" }}>
