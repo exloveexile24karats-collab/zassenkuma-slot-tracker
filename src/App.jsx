@@ -437,7 +437,14 @@ const DIGIT7_COLOR = "#f6a04d";
 // 日が続くと、隣同士の枠線がつながって中の▲〇マークが見えない「ベタ塗り
 // の青い塊」に見えてしまっていたのが原因。新しく入力したデータでも同じ
 // 現象が起きると指摘を受け、見た目自体を作り直した。
-const APP_VERSION = "6.9.25";
+// v6.9.26: 「バラエティコーナー（1台設置）」というツールチップ表現を修正。
+// 固定の一角がある前提の名前を勝手に付けていたが、実際は「その日たまたま
+// 1台構成だった」という意味でしかなく、台移動・台数削減などどんな理由でも
+// 起こりうる。実際のデータで確認したところ、この機種は5月〜6月末は複数台
+// 構成、7月頭あたりから1台構成に切り替わっていた（台移動によるものと
+// 思われる）。表現を「この日、店内で1台構成でした（理由は問わない）」に
+// 変更。
+const APP_VERSION = "6.9.26";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4909,7 +4916,7 @@ export default function SlotDataTracker() {
                   const hasRaw = isObjectMark && mark.rawLabel !== undefined;
                   const titleText = hasRaw
                     ? `表示値=${mark.label}　元の値=${mark.rawLabel}　G数=${mark.gsu !== null && mark.gsu !== undefined ? mark.gsu : "不明"}`
-                    : isVarietyCell ? "バラエティコーナー（1台設置）" : undefined;
+                    : isVarietyCell ? "この日、店内で1台構成でした（台移動・削減等の理由は問わない）" : undefined;
                   return (
                     <td
                       key={d}
