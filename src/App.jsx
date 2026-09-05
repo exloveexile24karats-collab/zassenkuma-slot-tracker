@@ -102,6 +102,12 @@ function rawFullTableWeekKey(date) {
   return `${RAW_FULLTABLE_KEY_PREFIX}week:${weekStartOf(date)}`;
 }
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
+// v6.9.30: sentinel value for the event multi-select filters — lets the
+// person filter the matrix tables down to "days with nothing registered,"
+// matching the same automatic "通常日（イベント無し）" pattern the scoring
+// engine already learns from (v6.9.29). Not a real event name, never
+// stored in dateEventMap — purely a filter-time concept.
+const NO_EVENT_FILTER_LABEL = "（イベント無し）";
 const DATALIST_ID = "slot-event-name-options";
 const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
 const FULLTABLE_MODEL_NAME_DATALIST_ID = "slot-fulltable-model-name-options";
@@ -467,7 +473,11 @@ const DIGIT7_COLOR = "#f6a04d";
 // 1つとして学習・加点対象になるよう追加。翌日にイベントが何も登録されて
 // いなければ「通常日（イベント無し）」として自動的に記録され、実測データ
 // から実際のポイントが算出される（登録されてるイベントと同じ扱い）。
-const APP_VERSION = "6.9.29";
+// v6.9.30: 機種×日付マトリクス表（全体データ・機種ページ両方）のイベント
+// 絞り込みに「（イベント無し）」の選択肢を追加。イベントが何も登録されて
+// いない日だけに絞り込める。v6.9.29で追加した自動学習の「通常日（イベント
+// 無し）」パターンと同じ考え方を、表示側のフィルターにも反映したもの。
+const APP_VERSION = "6.9.30";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4335,8 +4345,13 @@ export default function SlotDataTracker() {
   const overallGridDates = useMemo(() => {
     let dates;
     if (overallGridEventFilter.length > 0) {
+      const wantsNoEvent = overallGridEventFilter.includes(NO_EVENT_FILTER_LABEL);
+      const realNames = overallGridEventFilter.filter((n) => n !== NO_EVENT_FILTER_LABEL);
       dates = overallSortedSummaries
-        .filter((s) => s.event && splitEventNames(s.event).some((n) => overallGridEventFilter.includes(n)))
+        .filter((s) => {
+          if (!s.event) return wantsNoEvent;
+          return realNames.length > 0 && splitEventNames(s.event).some((n) => realNames.includes(n));
+        })
         .map((s) => s.date);
     } else {
       dates = overallSortedSummaries.slice(-30).map((s) => s.date);
@@ -4402,8 +4417,13 @@ export default function SlotDataTracker() {
   const pageGridDates = useMemo(() => {
     let dates;
     if (pageGridEventFilter.length > 0) {
+      const wantsNoEvent = pageGridEventFilter.includes(NO_EVENT_FILTER_LABEL);
+      const realNames = pageGridEventFilter.filter((n) => n !== NO_EVENT_FILTER_LABEL);
       dates = sortedHistory
-        .filter((h) => h.event && splitEventNames(h.event).some((n) => pageGridEventFilter.includes(n)))
+        .filter((h) => {
+          if (!h.event) return wantsNoEvent;
+          return realNames.length > 0 && splitEventNames(h.event).some((n) => realNames.includes(n));
+        })
         .map((h) => h.date);
     } else {
       dates = sortedHistory.slice(-30).map((h) => h.date);
@@ -4911,8 +4931,21 @@ export default function SlotDataTracker() {
   }
 
   function renderEventMultiSelect(selectedList, setSelectedList) {
+    const noEventActive = selectedList.includes(NO_EVENT_FILTER_LABEL);
     return (
       <div className="scrollbar" style={{ maxHeight: "120px", overflowY: "auto", display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "10px", padding: "8px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px" }}>
+        <button
+          onClick={() => toggleEventFilter(selectedList, setSelectedList, NO_EVENT_FILTER_LABEL)}
+          title="イベントが何も登録されていない日だけに絞り込みます"
+          style={{
+            fontSize: "11px", padding: "3px 8px", borderRadius: "999px", cursor: "pointer",
+            border: noEventActive ? "1px solid #8b93a3" : "1px solid #2a323f",
+            background: noEventActive ? "rgba(139,147,163,0.15)" : "transparent",
+            color: noEventActive ? "#c7cbd4" : "#5a6272",
+          }}
+        >
+          {NO_EVENT_FILTER_LABEL}
+        </button>
         {allKnownEventNames.length === 0 && <span style={{ fontSize: "11px", color: "#5a6272" }}>登録済みのイベントがまだありません。</span>}
         {allKnownEventNames.map((n) => {
           const active = selectedList.includes(n);
