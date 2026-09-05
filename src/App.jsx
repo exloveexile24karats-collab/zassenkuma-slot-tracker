@@ -463,7 +463,11 @@ const DIGIT7_COLOR = "#f6a04d";
 // 総行数を確認、修正で87行に）。あわせて、店舗全体の合計差枚を計算する
 // dailyStoreTotalsでも同じ理由でバラエティ機種の台数分（1台）が計算から
 // 漏れていたのを、isVarietyなら1台として数えるよう修正。
-const APP_VERSION = "6.9.28";
+// v6.9.29: 「イベント無し」の日を、手動で登録しなくても自動でパターンの
+// 1つとして学習・加点対象になるよう追加。翌日にイベントが何も登録されて
+// いなければ「通常日（イベント無し）」として自動的に記録され、実測データ
+// から実際のポイントが算出される（登録されてるイベントと同じ扱い）。
+const APP_VERSION = "6.9.29";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1231,6 +1235,12 @@ function learnSymbolPatternWeights(ctx, dateEventMap, strongEventNameSet, semiEv
         const evDigitMatch = ev.match(/([0-9])のつく日/);
         if (evDigitMatch && no % 10 === Number(evDigitMatch[1])) record("イベント名×台番号末尾一致", goodTomorrow);
       });
+      // v6.9.29: no manual flagging needed — a date with nothing registered
+      // in dateEventMap is automatically treated as "通常日" (no event) and
+      // recorded as its own pattern, so it gets a real measured point value
+      // just like every registered event does, instead of silently
+      // contributing nothing.
+      if (evsTomorrowAlways.length === 0) record("通常日（イベント無し）", goodTomorrow);
       const isStrongTomorrow = evsTomorrowAlways.some((ev) => strongEventNameSet.has(ev));
       if (isStrongTomorrow) record("強いイベント当日", goodTomorrow);
       // 自己平均比ローテーション（好調）— this machine's own trailing 7-day
@@ -1382,6 +1392,7 @@ function scoreSymbolPickupToday(ctx, learned, dateEventMap, strongEventNameSet, 
       const evDigitMatch = ev.match(/([0-9])のつく日/);
       if (evDigitMatch && no % 10 === Number(evDigitMatch[1])) add("イベント名×台番号末尾一致", weights["イベント名×台番号末尾一致"]);
     });
+    if (evsTomorrowAlways.length === 0) add("通常日（イベント無し）", weights["通常日（イベント無し）"]);
     const isStrongTomorrow = evsTomorrowAlways.some((ev) => strongEventNameSet.has(ev));
     if (isStrongTomorrow) add("強いイベント当日", weights["強いイベント当日"]);
     if (i >= 20) {
