@@ -477,7 +477,16 @@ const DIGIT7_COLOR = "#f6a04d";
 // 絞り込みに「（イベント無し）」の選択肢を追加。イベントが何も登録されて
 // いない日だけに絞り込める。v6.9.29で追加した自動学習の「通常日（イベント
 // 無し）」パターンと同じ考え方を、表示側のフィルターにも反映したもの。
-const APP_VERSION = "6.9.30";
+// v6.9.31: 重大なバグを修正。民レポを続けて何回か保存すると、直前に保存
+// した日付が消えてしまうことがあった。原因は、保存処理が古い状態
+// （overallSummaries）を参照して「次の内容」を組み立てていたため、連続で
+// 保存すると前の保存がまだ反映されないうちに次の保存が古い状態を土台にし
+// てしまい、結果的に上書きで消えてしまっていた（アナスロの週バケット保存
+// で以前直したのと同じ種類の競合バグ）。refを保存のたびに同期更新し、
+// 書き込みをキューで順番待ちさせる方式に統一。ランダム遅延を模したテスト
+// で、旧方式は5件保存しても2〜4件しか残らない・新方式は毎回5件とも正しく
+// 残ることを確認済み。
+const APP_VERSION = "6.9.31";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2186,6 +2195,17 @@ export default function SlotDataTracker() {
   // ---- store-wide overall summary (機種別サマリー + 末尾別データ), global,
   //      irregular entries, one snapshot per date ----
   const [overallSummaries, setOverallSummaries] = useState([]); // [{date,event,modelRows,digitRows}]
+  // v6.9.31: consecutive saves in quick succession (e.g. registering 民レポ
+  // for several dates one after another without waiting for each render to
+  // settle) were losing earlier saves — every place that builds "next" from
+  // `overallSummaries` was reading it from that render's own closure, which
+  // could be stale if a prior save's state update hadn't been processed yet.
+  // Same lost-update class as the アナスロ week-bucket bug fixed earlier in
+  // this app; same fix: a ref updated SYNCHRONOUSLY inside
+  // persistOverallSummaries itself (not via a useEffect, which would still
+  // lag behind rapid consecutive calls) — read instead of the possibly-
+  // stale state variable when building the next array to persist.
+  const overallSummariesRef = useRef([]);
   const [overallSummariesLoaded, setOverallSummariesLoaded] = useState(false);
   const [varietyRepairPreview, setVarietyRepairPreview] = useState(null); // { fixCandidates: [...], deleteCandidates: [...] } | null if not scanned yet
   const [varietyRepairDone, setVarietyRepairDone] = useState(false);
@@ -2339,7 +2359,10 @@ export default function SlotDataTracker() {
         const r6 = await storage.get(OVERALL_SUMMARY_KEY, false);
         if (r6 && r6.value) {
           const val = JSON.parse(r6.value);
-          if (Array.isArray(val)) setOverallSummaries(val);
+          if (Array.isArray(val)) {
+            overallSummariesRef.current = val;
+            setOverallSummaries(val);
+          }
         }
       } catch (e) {
         // none yet
@@ -2903,10 +2926,15 @@ export default function SlotDataTracker() {
     }
   }, []);
 
+  const overallSummariesWriteQueueRef = useRef(Promise.resolve());
   const persistOverallSummaries = useCallback(async (next) => {
+    overallSummariesRef.current = next; // synchronous — available to the very next call immediately, unlike state
     setOverallSummaries(next);
+    const previousWrite = overallSummariesWriteQueueRef.current;
+    const thisWrite = previousWrite.then(() => storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false));
+    overallSummariesWriteQueueRef.current = thisWrite.catch(() => null);
     try {
-      await storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false);
+      await thisWrite;
     } catch (e) {
       // ignore
     }
@@ -2936,6 +2964,7 @@ export default function SlotDataTracker() {
     if (storageKey === PAGES_KEY) {
       setPages(value || []);
     } else if (storageKey === OVERALL_SUMMARY_KEY) {
+      overallSummariesRef.current = value || [];
       setOverallSummaries(value || []);
     } else if (storageKey === CLOSED_DAYS_KEY) {
       setClosedDays(value || []);
@@ -2982,7 +3011,7 @@ export default function SlotDataTracker() {
     }
     const eventForDate = (dateEventMap[overallDate] || "").trim();
     const next = [
-      ...overallSummaries.filter((s) => s.date !== overallDate),
+      ...overallSummariesRef.current.filter((s) => s.date !== overallDate),
       { date: overallDate, event: eventForDate, modelRows, digitRows },
     ];
     persistOverallSummaries(next);
@@ -2994,8 +3023,8 @@ export default function SlotDataTracker() {
   }
 
   function handleDeleteOverall(date) {
-    pushUndoEntry(`全体データ ${date} を削除`, OVERALL_SUMMARY_KEY, overallSummaries);
-    persistOverallSummaries(overallSummaries.filter((s) => s.date !== date));
+    pushUndoEntry(`全体データ ${date} を削除`, OVERALL_SUMMARY_KEY, overallSummariesRef.current);
+    persistOverallSummaries(overallSummariesRef.current.filter((s) => s.date !== date));
     setConfirmDeleteOverall(null);
   }
 
@@ -3070,7 +3099,7 @@ export default function SlotDataTracker() {
   }
 
   function handleDeleteAllOverall() {
-    pushUndoEntry("全体データを全部削除", OVERALL_SUMMARY_KEY, overallSummaries);
+    pushUndoEntry("全体データを全部削除", OVERALL_SUMMARY_KEY, overallSummariesRef.current);
     persistOverallSummaries([]);
     setConfirmDeleteAllOverall(false);
   }
@@ -3191,7 +3220,7 @@ export default function SlotDataTracker() {
     if (!varietyRepairPreview) return;
     const { fixCandidates, deleteCandidates, resetCandidates } = varietyRepairPreview;
     if (fixCandidates.length === 0 && deleteCandidates.length === 0 && (!resetCandidates || resetCandidates.length === 0)) return;
-    pushUndoEntry("バラエティ機種の差枚を修復", OVERALL_SUMMARY_KEY, overallSummaries);
+    pushUndoEntry("バラエティ機種の差枚を修復", OVERALL_SUMMARY_KEY, overallSummariesRef.current);
     const fixByDate = {};
     fixCandidates.forEach((c) => {
       if (!fixByDate[c.date]) fixByDate[c.date] = new Map();
@@ -3207,7 +3236,7 @@ export default function SlotDataTracker() {
       if (!resetByDate[c.date]) resetByDate[c.date] = new Set();
       resetByDate[c.date].add(c.rowIndex);
     });
-    const nextSummaries = overallSummaries.map((s) => {
+    const nextSummaries = overallSummariesRef.current.map((s) => {
       const rowIndicesToFix = fixByDate[s.date];
       const rowIndicesToDelete = deleteByDate[s.date];
       const rowIndicesToReset = resetByDate[s.date];
@@ -3298,6 +3327,7 @@ export default function SlotDataTracker() {
         const idx = prevSummaries.findIndex((s) => s.date === date);
         if (idx === -1 || prevSummaries[idx].event === name) return prevSummaries;
         const next = prevSummaries.map((s, i) => (i === idx ? { ...s, event: name } : s));
+        overallSummariesRef.current = next; // keep the ref in lockstep, same reasoning as persistOverallSummaries
         storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false).catch(() => {});
         return next;
       });
@@ -4730,7 +4760,7 @@ export default function SlotDataTracker() {
 
   function handleResyncOverallEvents() {
     let changedCount = 0;
-    const next = overallSummaries.map((s) => {
+    const next = overallSummariesRef.current.map((s) => {
       const correctEvent = (dateEventMap[s.date] || "").trim();
       if (s.event === correctEvent) return s;
       changedCount += 1;
@@ -4740,7 +4770,7 @@ export default function SlotDataTracker() {
       setOverallStatus({ type: "ok", msg: "既にすべて最新の状態です。直す必要はありませんでした。" });
       return;
     }
-    pushUndoEntry("全体データのイベントを再同期", OVERALL_SUMMARY_KEY, overallSummaries);
+    pushUndoEntry("全体データのイベントを再同期", OVERALL_SUMMARY_KEY, overallSummariesRef.current);
     persistOverallSummaries(next);
     setOverallStatus({ type: "ok", msg: `${changedCount}件の日付のイベントを最新の登録内容に合わせて直しました。` });
   }
@@ -4836,6 +4866,7 @@ export default function SlotDataTracker() {
       const idx = prevSummaries.findIndex((s) => s.date === date);
       if (idx === -1 || !prevSummaries[idx].event) return prevSummaries;
       const next = prevSummaries.map((s, i) => (i === idx ? { ...s, event: remainingComposite } : s));
+      overallSummariesRef.current = next;
       storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false).catch(() => {});
       return next;
     });
