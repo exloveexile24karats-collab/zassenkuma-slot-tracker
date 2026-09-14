@@ -51,7 +51,20 @@ function splitEventNames(compositeStr) {
 function joinEventNames(names) {
   return names.filter(Boolean).join(EVENT_DELIMITER);
 }
-const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1";
+const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1"; // legacy single-blob key — kept only for one-time migration
+// v6.9.32: the single-blob OVERALL_SUMMARY_KEY above grew past the real
+// ~1MB per-value limit as 民レポ history accumulated (confirmed: 120 days
+// serialized to 1,147,257 bytes, over the 1,048,487 byte ceiling) — every
+// save had been silently failing while the UI still reported success,
+// since persistOverallSummaries didn't check the write actually succeeded.
+// Same fix as the アナスロ raw table: split into one key per WEEK
+// (Monday-anchored, reusing weekStartOf), with a small index key listing
+// which dates exist so loading never needs to guess which weeks to fetch.
+const OVERALL_SUMMARY_KEY_PREFIX = "slot-overall-summary-v1:week:";
+const OVERALL_SUMMARY_INDEX_KEY = "slot-overall-summary-index-v1"; // JSON array of "YYYY-MM-DD" strings
+function overallSummaryWeekKey(date) {
+  return `${OVERALL_SUMMARY_KEY_PREFIX}${weekStartOf(date)}`;
+}
 const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,startDate,endDate,label}]}
 // v6.8: raw per-machine, all-model, whole-store table paste. Independent of
 // whether a page/model is registered yet — this is the source of truth that
@@ -486,7 +499,23 @@ const DIGIT7_COLOR = "#f6a04d";
 // 書き込みをキューで順番待ちさせる方式に統一。ランダム遅延を模したテスト
 // で、旧方式は5件保存しても2〜4件しか残らない・新方式は毎回5件とも正しく
 // 残ることを確認済み。
-const APP_VERSION = "6.9.31";
+// v6.9.32: 民レポの保存が失敗し続けていた根本原因が判明・修正。民レポは
+// 全履歴を1つの保存キー（OVERALL_SUMMARY_KEY）に丸ごとJSON化して保存する
+// 方式だったが、実データ（120日分）で確認したところ既に約1.1MBに達して
+// おり、Firestoreの1フィールドあたりの実際の上限（約1,048,487バイト）を
+// 超えていた。そのため保存のたびに書き込み自体が失敗していたが、アプリ側
+// が書き込み結果を確認せずに「保存しました」と表示してしまっていたため、
+// 見た目上は成功しているように見えて実際は何も保存されていなかった。
+// アナスロの生データで既に採用している「週単位（月曜始まり）で1キー」の
+// 方式に統一し、既存の巨大な単一キーからの自動移行も実装。実データ（120
+// 日分）で移行テストを実施し、19個の週バケット（各25KB〜70KB、上限に対し
+// て十分小さい）に正しく分割されること、移行後は旧キーが削除されること、
+// 保存関連の全操作（新規保存・削除・全削除・イベント再同期・バラエティ
+// 修復・取り消し復元）が新しい週バケット方式を正しく使うことを確認済み。
+// あわせて、保存関数が結果を返すようにし、呼び出し側も実際に成功したかを
+// 確認してから「保存しました」を表示するよう修正（今後同種の失敗が起きて
+// も、黙って握りつぶさずエラー表示するようになった）。
+const APP_VERSION = "6.9.32";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2206,6 +2235,9 @@ export default function SlotDataTracker() {
   // lag behind rapid consecutive calls) — read instead of the possibly-
   // stale state variable when building the next array to persist.
   const overallSummariesRef = useRef([]);
+  const overallSummariesIndexRef = useRef([]); // current known list of dates that have 民レポ data, kept in lockstep with storage
+  const overallSummariesWeekWriteQueueRef = useRef({}); // weekKey -> queue promise, same pattern as アナスロ's week buckets
+  const overallSummariesIndexWriteQueueRef = useRef(Promise.resolve());
   const [overallSummariesLoaded, setOverallSummariesLoaded] = useState(false);
   const [varietyRepairPreview, setVarietyRepairPreview] = useState(null); // { fixCandidates: [...], deleteCandidates: [...] } | null if not scanned yet
   const [varietyRepairDone, setVarietyRepairDone] = useState(false);
@@ -2356,12 +2388,74 @@ export default function SlotDataTracker() {
         // none yet
       }
       try {
-        const r6 = await storage.get(OVERALL_SUMMARY_KEY, false);
-        if (r6 && r6.value) {
-          const val = JSON.parse(r6.value);
-          if (Array.isArray(val)) {
-            overallSummariesRef.current = val;
-            setOverallSummaries(val);
+        let overallDates = null; // null = index missing entirely (need migration check), [] = migrated already but empty
+        try {
+          const idx = await storage.get(OVERALL_SUMMARY_INDEX_KEY, false);
+          if (idx && idx.value) overallDates = JSON.parse(idx.value);
+        } catch (e) {
+          // index missing — either never migrated, or genuinely nothing saved yet
+        }
+
+        if (overallDates !== null) {
+          // fast path: index exists, fetch only the weeks it actually needs
+          const weekKeys = Array.from(new Set(overallDates.map((d) => overallSummaryWeekKey(d))));
+          const results = await Promise.all(
+            weekKeys.map(async (key) => {
+              try {
+                const r = await storage.get(key, false);
+                return r && r.value ? JSON.parse(r.value) : null;
+              } catch (e) {
+                return null;
+              }
+            })
+          );
+          const merged = [];
+          results.forEach((bucket) => {
+            if (Array.isArray(bucket)) merged.push(...bucket);
+          });
+          merged.sort((a, b) => a.date.localeCompare(b.date));
+          overallSummariesIndexRef.current = overallDates;
+          overallSummariesRef.current = merged;
+          setOverallSummaries(merged);
+        } else {
+          // no index yet — check for the legacy single-blob key and migrate
+          // it once into weekly buckets, rather than starting from empty
+          let legacyVal = null;
+          try {
+            const legacy = await storage.get(OVERALL_SUMMARY_KEY, false);
+            if (legacy && legacy.value) {
+              const parsed = JSON.parse(legacy.value);
+              if (Array.isArray(parsed)) legacyVal = parsed;
+            }
+          } catch (e) {
+            // no legacy data either
+          }
+          if (legacyVal && legacyVal.length > 0) {
+            const buckets = {};
+            legacyVal.forEach((s) => {
+              const wk = overallSummaryWeekKey(s.date);
+              if (!buckets[wk]) buckets[wk] = [];
+              buckets[wk].push(s);
+            });
+            const writeResults = await Promise.all(
+              Object.entries(buckets).map(async ([wk, arr]) => ({ wk, ok: !!(await storage.set(wk, JSON.stringify(arr), false)) }))
+            );
+            const failed = writeResults.filter((r) => !r.ok);
+            const newDates = legacyVal.map((s) => s.date).sort();
+            if (failed.length === 0) {
+              await storage.set(OVERALL_SUMMARY_INDEX_KEY, JSON.stringify(newDates), false);
+              await storage.delete(OVERALL_SUMMARY_KEY, false);
+              setOverallStatus({ type: "ok", msg: `民レポの保存方式を更新しました（${legacyVal.length}件、週別に分割）。これで1件ごとの保存が確実になります。` });
+            } else {
+              setOverallStatus({ type: "error", msg: "民レポの保存方式の更新中に一部失敗しました。もう一度読み込み直してみてください。" });
+            }
+            overallSummariesIndexRef.current = newDates;
+            overallSummariesRef.current = legacyVal;
+            setOverallSummaries(legacyVal);
+          } else {
+            overallSummariesIndexRef.current = [];
+            overallSummariesRef.current = [];
+            setOverallSummaries([]);
           }
         }
       } catch (e) {
@@ -2430,16 +2524,10 @@ export default function SlotDataTracker() {
         // trusted that incomplete index forever and never looked for the
         // rest again. Comparing against 民レポ's own date list every time
         // catches that instead of silently accepting a stale, partial index.
-        let candidateDates = [];
-        try {
-          const r6 = await storage.get(OVERALL_SUMMARY_KEY, false);
-          if (r6 && r6.value) {
-            const val = JSON.parse(r6.value);
-            if (Array.isArray(val)) candidateDates = val.map((s) => s.date).filter(Boolean);
-          }
-        } catch (e) {
-          // no 民レポ dates available — nothing to reconcile against this time
-        }
+        // v6.9.32: 民レポ itself moved to weekly buckets — read the already-
+        // loaded overallSummariesRef (populated earlier in this same load
+        // sequence) instead of the now-legacy single-blob key.
+        const candidateDates = overallSummariesRef.current.map((s) => s.date).filter(Boolean);
         const missingDates = candidateDates.filter((d) => !(d in next));
 
         if (missingDates.length > 0) {
@@ -2926,17 +3014,53 @@ export default function SlotDataTracker() {
     }
   }, []);
 
-  const overallSummariesWriteQueueRef = useRef(Promise.resolve());
   const persistOverallSummaries = useCallback(async (next) => {
+    // v6.9.32: writes only the WEEK buckets actually touched by this change
+    // (union of the weeks in the previous ref value and the new `next`,
+    // since a date's entry could have been removed entirely, leaving that
+    // week's bucket empty) — not the whole history as one blob, which is
+    // what silently exceeded the ~1MB per-value limit.
+    const previous = overallSummariesRef.current;
     overallSummariesRef.current = next; // synchronous — available to the very next call immediately, unlike state
     setOverallSummaries(next);
-    const previousWrite = overallSummariesWriteQueueRef.current;
-    const thisWrite = previousWrite.then(() => storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false));
-    overallSummariesWriteQueueRef.current = thisWrite.catch(() => null);
+
+    const touchedWeeks = new Set([
+      ...previous.map((s) => overallSummaryWeekKey(s.date)),
+      ...next.map((s) => overallSummaryWeekKey(s.date)),
+    ]);
+    const nextByWeek = {};
+    next.forEach((s) => {
+      const wk = overallSummaryWeekKey(s.date);
+      if (!nextByWeek[wk]) nextByWeek[wk] = [];
+      nextByWeek[wk].push(s);
+    });
+
+    const weekWrites = Array.from(touchedWeeks).map((wk) => {
+      const previousWrite = overallSummariesWeekWriteQueueRef.current[wk] || Promise.resolve();
+      const bucket = nextByWeek[wk] || [];
+      const thisWrite = previousWrite.then(() =>
+        bucket.length > 0 ? storage.set(wk, JSON.stringify(bucket), false) : storage.delete(wk, false)
+      );
+      overallSummariesWeekWriteQueueRef.current[wk] = thisWrite.catch(() => null);
+      return thisWrite;
+    });
+
+    const nextDates = next.map((s) => s.date).sort();
+    overallSummariesIndexRef.current = nextDates;
+    const previousIndexWrite = overallSummariesIndexWriteQueueRef.current;
+    const indexWrite = previousIndexWrite.then(() => storage.set(OVERALL_SUMMARY_INDEX_KEY, JSON.stringify(nextDates), false));
+    overallSummariesIndexWriteQueueRef.current = indexWrite.catch(() => null);
+
     try {
-      await thisWrite;
+      const results = await Promise.all([...weekWrites, indexWrite]);
+      if (results.some((r) => !r)) {
+        setOverallStatus({ type: "error", msg: "保存の一部に失敗しました（storage.setがfalsyな結果を返しました）。もう一度お試しください。" });
+        return false;
+      }
+      return true;
     } catch (e) {
-      // ignore
+      setOverallStatus({ type: "error", msg: `保存中にエラーが発生しました：${e && e.message ? e.message : "詳細不明"}` });
+      return false;
     }
   }, []);
 
@@ -2986,6 +3110,17 @@ export default function SlotDataTracker() {
   }
 
   async function handleRestoreUndo(entry) {
+    if (entry.storageKey === OVERALL_SUMMARY_KEY) {
+      // v6.9.32: 民レポ no longer lives at this single key (moved to weekly
+      // buckets) — route the restore through persistOverallSummaries so it
+      // actually writes back to the current storage scheme, instead of
+      // resurrecting the legacy blob key (which the loader no longer reads
+      // after the one-time migration, and which could itself exceed the
+      // size limit again).
+      await persistOverallSummaries(entry.previousValue || []);
+      persistUndoHistory(undoHistory.filter((h) => h.id !== entry.id));
+      return;
+    }
     try {
       await storage.set(entry.storageKey, JSON.stringify(entry.previousValue), false);
     } catch (e) {
@@ -2999,7 +3134,7 @@ export default function SlotDataTracker() {
     persistUndoHistory(undoHistory.filter((h) => h.id !== id));
   }
 
-  function handleSaveOverall() {
+  async function handleSaveOverall() {
     if (!overallDate) {
       setOverallStatus({ type: "error", msg: "日付を入力してください。" });
       return;
@@ -3014,7 +3149,8 @@ export default function SlotDataTracker() {
       ...overallSummariesRef.current.filter((s) => s.date !== overallDate),
       { date: overallDate, event: eventForDate, modelRows, digitRows },
     ];
-    persistOverallSummaries(next);
+    const ok = await persistOverallSummaries(next);
+    if (!ok) return; // persistOverallSummaries already set an error status
     setOverallStatus({
       type: "ok",
       msg: `${overallDate} のデータを保存しました（機種${modelRows.length}件・末尾${digitRows.length}件）。`,
@@ -3216,7 +3352,7 @@ export default function SlotDataTracker() {
     setVarietyRepairPreview({ fixCandidates, deleteCandidates, unrecoverableCandidates, resetCandidates });
   }
 
-  function applyVarietyRepair() {
+  async function applyVarietyRepair() {
     if (!varietyRepairPreview) return;
     const { fixCandidates, deleteCandidates, resetCandidates } = varietyRepairPreview;
     if (fixCandidates.length === 0 && deleteCandidates.length === 0 && (!resetCandidates || resetCandidates.length === 0)) return;
@@ -3259,7 +3395,8 @@ export default function SlotDataTracker() {
         });
       return { ...s, modelRows: nextModelRows };
     });
-    persistOverallSummaries(nextSummaries);
+    const ok = await persistOverallSummaries(nextSummaries);
+    if (!ok) return;
     setVarietyRepairPreview(null);
     setVarietyRepairDone(true);
   }
@@ -3328,7 +3465,16 @@ export default function SlotDataTracker() {
         if (idx === -1 || prevSummaries[idx].event === name) return prevSummaries;
         const next = prevSummaries.map((s, i) => (i === idx ? { ...s, event: name } : s));
         overallSummariesRef.current = next; // keep the ref in lockstep, same reasoning as persistOverallSummaries
-        storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false).catch(() => {});
+        // v6.9.32: only this ONE date's week bucket needs rewriting (the
+        // date list itself isn't changing, so the index doesn't need an
+        // update) — writing the whole legacy blob key here was part of the
+        // same oversized-single-key bug.
+        const wk = overallSummaryWeekKey(date);
+        const bucket = next.filter((s) => overallSummaryWeekKey(s.date) === wk);
+        const previousWrite = overallSummariesWeekWriteQueueRef.current[wk] || Promise.resolve();
+        const thisWrite = previousWrite.then(() => storage.set(wk, JSON.stringify(bucket), false));
+        overallSummariesWeekWriteQueueRef.current[wk] = thisWrite.catch(() => null);
+        thisWrite.catch(() => {});
         return next;
       });
     },
@@ -4758,7 +4904,7 @@ export default function SlotDataTracker() {
     persistPageRecommends(recommendTargetPageId, recommendTargetList.filter((r) => r.id !== id));
   }
 
-  function handleResyncOverallEvents() {
+  async function handleResyncOverallEvents() {
     let changedCount = 0;
     const next = overallSummariesRef.current.map((s) => {
       const correctEvent = (dateEventMap[s.date] || "").trim();
@@ -4771,7 +4917,8 @@ export default function SlotDataTracker() {
       return;
     }
     pushUndoEntry("全体データのイベントを再同期", OVERALL_SUMMARY_KEY, overallSummariesRef.current);
-    persistOverallSummaries(next);
+    const ok = await persistOverallSummaries(next);
+    if (!ok) return;
     setOverallStatus({ type: "ok", msg: `${changedCount}件の日付のイベントを最新の登録内容に合わせて直しました。` });
   }
 
@@ -4867,7 +5014,12 @@ export default function SlotDataTracker() {
       if (idx === -1 || !prevSummaries[idx].event) return prevSummaries;
       const next = prevSummaries.map((s, i) => (i === idx ? { ...s, event: remainingComposite } : s));
       overallSummariesRef.current = next;
-      storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false).catch(() => {});
+      const wk = overallSummaryWeekKey(date);
+      const bucket = next.filter((s) => overallSummaryWeekKey(s.date) === wk);
+      const previousWrite = overallSummariesWeekWriteQueueRef.current[wk] || Promise.resolve();
+      const thisWrite = previousWrite.then(() => storage.set(wk, JSON.stringify(bucket), false));
+      overallSummariesWeekWriteQueueRef.current[wk] = thisWrite.catch(() => null);
+      thisWrite.catch(() => {});
       return next;
     });
   }
